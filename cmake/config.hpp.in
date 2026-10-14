@@ -1,0 +1,4 @@
+#pragma once
+
+// Target-specific node layout. Reconfigure and rebuild for a different value.
+#define HFT_CACHE_LINE_SIZE @_hft_line_size@
