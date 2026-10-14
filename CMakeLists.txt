@@ -122,11 +122,29 @@ if(HFT_ENABLE_SANITIZERS)
   target_link_options(hft_build_options INTERFACE -fsanitize=address,undefined)
 endif()
 
+# SIMD backend preference. This selects a documented default
+# for hft_cache; it never adds -march flags. The SIMD implementation exposes
+# hft::Backend and performs CPU/OS feature detection at runtime, so runtime
+# selection remains authoritative. The chosen token is exported as the PUBLIC
+# compile definition HFT_SIMD_DEFAULT=<TOKEN>, where <TOKEN> is one of AUTO,
+# SCALAR, SSE2 or AVX2. The definition is advisory, for documentation and
+# diagnostics only: the current SIMD header defines no compile-time backend
+# switch, and an unavailable forced backend still fails at runtime.
+set(HFT_SIMD "AUTO" CACHE STRING
+    "Default SIMD backend preference: AUTO, SCALAR, SSE2 or AVX2")
+set_property(CACHE HFT_SIMD PROPERTY STRINGS AUTO SCALAR SSE2 AVX2)
+if(NOT HFT_SIMD MATCHES "^(AUTO|SCALAR|SSE2|AVX2)$")
+  message(FATAL_ERROR
+    "Invalid HFT_SIMD value '${HFT_SIMD}'. Valid values are: AUTO, SCALAR, SSE2, AVX2.")
+endif()
+message(STATUS "HFT SIMD preference: ${HFT_SIMD} (runtime backend selection remains authoritative)")
+
 set(_hft_tree_source "${CMAKE_CURRENT_SOURCE_DIR}/src/cache_tree.cpp")
 set(_hft_simd_source "${CMAKE_CURRENT_SOURCE_DIR}/src/simd_search.cpp")
 if(EXISTS "${_hft_tree_source}" AND EXISTS "${_hft_simd_source}")
   add_library(hft_cache "${_hft_tree_source}" "${_hft_simd_source}")
   target_link_libraries(hft_cache PUBLIC hft_build_options)
+  target_compile_definitions(hft_cache PUBLIC "HFT_SIMD_DEFAULT=${HFT_SIMD}")
   target_include_directories(hft_cache PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
