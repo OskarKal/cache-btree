@@ -1,0 +1,31 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# Compiled binaries and objects
+benchmark_both
+copytest
+temp
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Profiling and tracing output
+perf.data
+perf.data.*
+*.perf
+gmon.out
+callgrind.out.*
+
+# Benchmark results (generated)
+*.csv
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
