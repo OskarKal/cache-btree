@@ -28,7 +28,8 @@ std::int32_t CacheTree::find_leaf(std::int32_t key) const {
     std::int32_t index = 0;
     while (!nodes_[index].is_leaf()) {
         const Node& node = nodes_[index];
-        index = node.slots[hft::upper_bound(node.keys, node.count(), key, backend_)];
+        index = node.slots[hft::upper_bound_resolved(node.keys, node.count(), key,
+                                                     backend_, readable_keys_)];
     }
     return index;
 }
@@ -123,12 +124,14 @@ void CacheTree::insert(std::int32_t key, std::int32_t value) {
     std::int32_t index = 0;
     while (!nodes_[index].is_leaf()) {
         const Node& node = nodes_[index];
-        const std::size_t child = hft::upper_bound(node.keys, node.count(), key, backend_);
+        const std::size_t child = hft::upper_bound_resolved(node.keys, node.count(), key,
+                                                            backend_, readable_keys_);
         path.push_back({index, child});
         index = node.slots[child];
     }
     const std::size_t count = nodes_[index].count();
-    const std::size_t position = hft::lower_bound(nodes_[index].keys, count, key, backend_);
+    const std::size_t position = hft::lower_bound_resolved(nodes_[index].keys, count, key,
+                                                           backend_, readable_keys_);
     if (position < count && nodes_[index].keys[position] == key) {
         nodes_[index].slots[position] = value;
         return;
@@ -188,7 +191,8 @@ void CacheTree::insert(std::int32_t key, std::int32_t value) {
 
 std::optional<std::int32_t> CacheTree::find(std::int32_t key) const {
     const Node& leaf = nodes_[find_leaf(key)];
-    const std::size_t position = hft::lower_bound(leaf.keys, leaf.count(), key, backend_);
+    const std::size_t position = hft::lower_bound_resolved(leaf.keys, leaf.count(), key,
+                                                           backend_, readable_keys_);
     if (position < leaf.count() && leaf.keys[position] == key) return leaf.slots[position];
     return std::nullopt;
 }
@@ -198,10 +202,13 @@ std::vector<std::int32_t> CacheTree::range_search(std::int32_t start_key,
     std::vector<std::int32_t> result;
     if (length <= 0) return result;
     const std::size_t limit = static_cast<std::size_t>(length);
-    result.reserve(std::min(limit, size_));
+    // Reserve only a small prefix: a range starting past the last key would
+    // otherwise allocate O(size_) for a result that is usually empty or short.
+    result.reserve(std::min<std::size_t>(limit, 64));
     std::int32_t index = find_leaf(start_key);
-    std::size_t position = hft::lower_bound(nodes_[index].keys, nodes_[index].count(),
-                                            start_key, backend_);
+    std::size_t position = hft::lower_bound_resolved(nodes_[index].keys,
+                                                     nodes_[index].count(), start_key,
+                                                     backend_, readable_keys_);
     do {
         const Node& leaf = nodes_[index];
         while (position < leaf.count() && result.size() < limit) {

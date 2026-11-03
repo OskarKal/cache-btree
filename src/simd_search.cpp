@@ -1,5 +1,6 @@
 #include "hft/simd_search.hpp"
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -10,7 +11,11 @@
 // GCC and Clang both provide GNU-style function targeting. Clang defines
 // __GNUC__ too. AVX needs OS-enabled XMM/YMM state, SSE2 needs XMM state.
 #define HFT_SIMD_USE_SSE2 1
+#if defined(HFT_SIMD_DISABLE_AVX2)
+#define HFT_SIMD_USE_AVX2 0
+#else
 #define HFT_SIMD_USE_AVX2 1
+#endif
 #define HFT_SIMD_TARGET(isa) __attribute__((target(isa)))
 #include <immintrin.h>
 #else
@@ -49,7 +54,21 @@ std::size_t scalar_upper_bound(const std::int32_t* keys, std::size_t cnt,
     return first;
 }
 
+// room must cover the keys. It may exceed cnt, in which case a SIMD backend can
+// read whole vectors past the final key as long as the extra lanes are masked.
+std::size_t effective_room(std::size_t cnt, std::size_t room) {
+    return room < cnt ? cnt : room;
+}
+
 #if HFT_SIMD_USE_SSE2
+
+constexpr std::size_t kSse2Width = 4;
+constexpr unsigned kSse2Full = (1u << kSse2Width) - 1u;
+
+unsigned sse2_lane_mask(std::size_t valid) {
+    return valid >= kSse2Width ? kSse2Full
+                               : (1u << static_cast<unsigned>(valid)) - 1u;
+}
 
 bool cpu_supports_sse2() {
     __builtin_cpu_init();
@@ -63,25 +82,27 @@ bool cpu_supports_sse2() {
 #endif
 }
 
-bool cpu_os_support_avx2() {
-    __builtin_cpu_init();
-    // GCC/Clang CPU feature detection includes OSXSAVE/XCR0 checks for AVX.
-    return __builtin_cpu_supports("avx2");
-}
-
 HFT_SIMD_TARGET("sse2")
 std::size_t sse2_lower_bound(const std::int32_t* keys, std::size_t cnt,
-                             std::int32_t key) {
+                             std::int32_t key, std::size_t room) {
     const __m128i needle = _mm_set1_epi32(key);
     std::size_t i = 0;
-    for (; cnt - i >= 4; i += 4) {
-        const __m128i values = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(keys + i));
-        const int mask = _mm_movemask_ps(
-            _mm_castsi128_ps(_mm_cmpgt_epi32(needle, values)));
-        if (mask != 15) {
-            return i + static_cast<std::size_t>(__builtin_ctz(~mask));
+    while (i < cnt && i + kSse2Width <= room) {
+        __m128i values;
+        std::memcpy(&values, keys + i, sizeof(values));
+        const unsigned valid = sse2_lane_mask(cnt - i < kSse2Width
+                                                  ? cnt - i
+                                                  : kSse2Width);
+        const unsigned less = static_cast<unsigned>(_mm_movemask_ps(
+                                  _mm_castsi128_ps(_mm_cmpgt_epi32(needle, values)))) &
+                              valid;
+        if (less != valid) {
+            return i + static_cast<std::size_t>(__builtin_ctz(~less & valid));
         }
+        if (valid != kSse2Full) {
+            return cnt;
+        }
+        i += kSse2Width;
     }
     for (; i < cnt && keys[i] < key; ++i) {
     }
@@ -90,17 +111,25 @@ std::size_t sse2_lower_bound(const std::int32_t* keys, std::size_t cnt,
 
 HFT_SIMD_TARGET("sse2")
 std::size_t sse2_upper_bound(const std::int32_t* keys, std::size_t cnt,
-                             std::int32_t key) {
+                             std::int32_t key, std::size_t room) {
     const __m128i needle = _mm_set1_epi32(key);
     std::size_t i = 0;
-    for (; cnt - i >= 4; i += 4) {
-        const __m128i values = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(keys + i));
-        const int mask = _mm_movemask_ps(
-            _mm_castsi128_ps(_mm_cmpgt_epi32(values, needle)));
-        if (mask != 0) {
-            return i + static_cast<std::size_t>(__builtin_ctz(mask));
+    while (i < cnt && i + kSse2Width <= room) {
+        __m128i values;
+        std::memcpy(&values, keys + i, sizeof(values));
+        const unsigned valid = sse2_lane_mask(cnt - i < kSse2Width
+                                                  ? cnt - i
+                                                  : kSse2Width);
+        const unsigned greater = static_cast<unsigned>(_mm_movemask_ps(
+                                     _mm_castsi128_ps(_mm_cmpgt_epi32(values, needle)))) &
+                                 valid;
+        if (greater != 0) {
+            return i + static_cast<std::size_t>(__builtin_ctz(greater));
         }
+        if (valid != kSse2Full) {
+            return cnt;
+        }
+        i += kSse2Width;
     }
     for (; i < cnt && keys[i] <= key; ++i) {
     }
@@ -111,19 +140,41 @@ std::size_t sse2_upper_bound(const std::int32_t* keys, std::size_t cnt,
 
 #if HFT_SIMD_USE_AVX2
 
+constexpr std::size_t kAvx2Width = 8;
+constexpr unsigned kAvx2Full = (1u << kAvx2Width) - 1u;
+
+unsigned avx2_lane_mask(std::size_t valid) {
+    return valid >= kAvx2Width ? kAvx2Full
+                               : (1u << static_cast<unsigned>(valid)) - 1u;
+}
+
+bool cpu_os_support_avx2() {
+    __builtin_cpu_init();
+    // GCC/Clang CPU feature detection includes OSXSAVE/XCR0 checks for AVX.
+    return __builtin_cpu_supports("avx2");
+}
+
 HFT_SIMD_TARGET("avx2")
 std::size_t avx2_lower_bound(const std::int32_t* keys, std::size_t cnt,
-                             std::int32_t key) {
+                             std::int32_t key, std::size_t room) {
     const __m256i needle = _mm256_set1_epi32(key);
     std::size_t i = 0;
-    for (; cnt - i >= 8; i += 8) {
-        const __m256i values =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(keys + i));
-        const int mask = _mm256_movemask_ps(
-            _mm256_castsi256_ps(_mm256_cmpgt_epi32(needle, values)));
-        if (mask != 255) {
-            return i + static_cast<std::size_t>(__builtin_ctz(~mask));
+    while (i < cnt && i + kAvx2Width <= room) {
+        __m256i values;
+        std::memcpy(&values, keys + i, sizeof(values));
+        const unsigned valid = avx2_lane_mask(cnt - i < kAvx2Width
+                                                  ? cnt - i
+                                                  : kAvx2Width);
+        const unsigned less = static_cast<unsigned>(_mm256_movemask_ps(
+                                  _mm256_castsi256_ps(_mm256_cmpgt_epi32(needle, values)))) &
+                              valid;
+        if (less != valid) {
+            return i + static_cast<std::size_t>(__builtin_ctz(~less & valid));
         }
+        if (valid != kAvx2Full) {
+            return cnt;
+        }
+        i += kAvx2Width;
     }
     for (; i < cnt && keys[i] < key; ++i) {
     }
@@ -132,17 +183,25 @@ std::size_t avx2_lower_bound(const std::int32_t* keys, std::size_t cnt,
 
 HFT_SIMD_TARGET("avx2")
 std::size_t avx2_upper_bound(const std::int32_t* keys, std::size_t cnt,
-                             std::int32_t key) {
+                             std::int32_t key, std::size_t room) {
     const __m256i needle = _mm256_set1_epi32(key);
     std::size_t i = 0;
-    for (; cnt - i >= 8; i += 8) {
-        const __m256i values =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(keys + i));
-        const int mask = _mm256_movemask_ps(
-            _mm256_castsi256_ps(_mm256_cmpgt_epi32(values, needle)));
-        if (mask != 0) {
-            return i + static_cast<std::size_t>(__builtin_ctz(mask));
+    while (i < cnt && i + kAvx2Width <= room) {
+        __m256i values;
+        std::memcpy(&values, keys + i, sizeof(values));
+        const unsigned valid = avx2_lane_mask(cnt - i < kAvx2Width
+                                                  ? cnt - i
+                                                  : kAvx2Width);
+        const unsigned greater = static_cast<unsigned>(_mm256_movemask_ps(
+                                     _mm256_castsi256_ps(_mm256_cmpgt_epi32(values, needle)))) &
+                                 valid;
+        if (greater != 0) {
+            return i + static_cast<std::size_t>(__builtin_ctz(greater));
         }
+        if (valid != kAvx2Full) {
+            return cnt;
+        }
+        i += kAvx2Width;
     }
     for (; i < cnt && keys[i] <= key; ++i) {
     }
@@ -184,17 +243,17 @@ bool supported(Backend backend) {
 }
 
 std::size_t dispatch_lower(const std::int32_t* keys, std::size_t cnt,
-                           std::int32_t key, Backend backend) {
+                           std::int32_t key, Backend backend, std::size_t room) {
     switch (backend) {
         case Backend::Scalar:
             return scalar_lower_bound(keys, cnt, key);
 #if HFT_SIMD_USE_SSE2
         case Backend::SSE2:
-            return sse2_lower_bound(keys, cnt, key);
+            return sse2_lower_bound(keys, cnt, key, room);
 #endif
 #if HFT_SIMD_USE_AVX2
         case Backend::AVX2:
-            return avx2_lower_bound(keys, cnt, key);
+            return avx2_lower_bound(keys, cnt, key, room);
 #endif
         default:
             unsupported(backend);
@@ -202,17 +261,17 @@ std::size_t dispatch_lower(const std::int32_t* keys, std::size_t cnt,
 }
 
 std::size_t dispatch_upper(const std::int32_t* keys, std::size_t cnt,
-                           std::int32_t key, Backend backend) {
+                           std::int32_t key, Backend backend, std::size_t room) {
     switch (backend) {
         case Backend::Scalar:
             return scalar_upper_bound(keys, cnt, key);
 #if HFT_SIMD_USE_SSE2
         case Backend::SSE2:
-            return sse2_upper_bound(keys, cnt, key);
+            return sse2_upper_bound(keys, cnt, key, room);
 #endif
 #if HFT_SIMD_USE_AVX2
         case Backend::AVX2:
-            return avx2_upper_bound(keys, cnt, key);
+            return avx2_upper_bound(keys, cnt, key, room);
 #endif
         default:
             unsupported(backend);
@@ -257,14 +316,34 @@ const char* backend_name(Backend backend) {
     return "unknown";
 }
 
+std::size_t lower_bound_resolved(const std::int32_t* keys, std::size_t cnt,
+                                 std::int32_t key, Backend backend,
+                                 std::size_t room) {
+    if (backend == Backend::Auto) {
+        backend = resolve_backend(backend);
+    }
+    return dispatch_lower(keys, cnt, key, backend, effective_room(cnt, room));
+}
+
+std::size_t upper_bound_resolved(const std::int32_t* keys, std::size_t cnt,
+                                 std::int32_t key, Backend backend,
+                                 std::size_t room) {
+    if (backend == Backend::Auto) {
+        backend = resolve_backend(backend);
+    }
+    return dispatch_upper(keys, cnt, key, backend, effective_room(cnt, room));
+}
+
 std::size_t lower_bound(const std::int32_t* keys, std::size_t cnt,
-                        std::int32_t key, Backend backend) {
-    return dispatch_lower(keys, cnt, key, resolve_backend(backend));
+                        std::int32_t key, Backend backend, std::size_t room) {
+    return dispatch_lower(keys, cnt, key, resolve_backend(backend),
+                          effective_room(cnt, room));
 }
 
 std::size_t upper_bound(const std::int32_t* keys, std::size_t cnt,
-                        std::int32_t key, Backend backend) {
-    return dispatch_upper(keys, cnt, key, resolve_backend(backend));
+                        std::int32_t key, Backend backend, std::size_t room) {
+    return dispatch_upper(keys, cnt, key, resolve_backend(backend),
+                          effective_room(cnt, room));
 }
 
 }  // namespace hft

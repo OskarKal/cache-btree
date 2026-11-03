@@ -117,50 +117,68 @@ if(HFT_ENABLE_SANITIZERS)
   if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     message(FATAL_ERROR "HFT_ENABLE_SANITIZERS requires a GCC- or Clang-compatible compiler.")
   endif()
+  # -fno-sanitize-recover=all makes UBSan terminate instead of printing a
+  # diagnostic and continuing, so a sanitizer finding fails ctest.
   target_compile_options(hft_build_options INTERFACE
-                         -fsanitize=address,undefined -fno-omit-frame-pointer)
+                         -fsanitize=address,undefined -fno-sanitize-recover=all
+                         -fno-omit-frame-pointer)
   target_link_options(hft_build_options INTERFACE -fsanitize=address,undefined)
 endif()
 
-# SIMD backend preference. This selects a documented default
-# for hft_cache; it never adds -march flags. The SIMD implementation exposes
-# hft::Backend and performs CPU/OS feature detection at runtime, so runtime
-# selection remains authoritative. The chosen token is exported as the PUBLIC
-# compile definition HFT_SIMD_DEFAULT=<TOKEN>, where <TOKEN> is one of AUTO,
-# SCALAR, SSE2 or AVX2. The definition is advisory, for documentation and
-# diagnostics only: the current SIMD header defines no compile-time backend
-# switch, and an unavailable forced backend still fails at runtime.
+# SIMD compile-time ceiling. This never adds -march flags. HFT_SIMD=SCALAR
+# compiles the library without SSE2/AVX2 code, HFT_SIMD=SSE2 compiles SSE2 but
+# disables AVX2, and AUTO/AVX2 keep both. Runtime CPU/OS detection still decides
+# which compiled backend Auto selects. HFT_SIMD_DEFAULT=<TOKEN> is also exported
+# publicly for diagnostics.
 set(HFT_SIMD "AUTO" CACHE STRING
-    "Default SIMD backend preference: AUTO, SCALAR, SSE2 or AVX2")
+    "SIMD compile-time ceiling and default preference: AUTO, SCALAR, SSE2 or AVX2")
 set_property(CACHE HFT_SIMD PROPERTY STRINGS AUTO SCALAR SSE2 AVX2)
 if(NOT HFT_SIMD MATCHES "^(AUTO|SCALAR|SSE2|AVX2)$")
   message(FATAL_ERROR
     "Invalid HFT_SIMD value '${HFT_SIMD}'. Valid values are: AUTO, SCALAR, SSE2, AVX2.")
 endif()
-message(STATUS "HFT SIMD preference: ${HFT_SIMD} (runtime backend selection remains authoritative)")
+set(_hft_simd_definitions)
+if(HFT_SIMD STREQUAL "SCALAR")
+  list(APPEND _hft_simd_definitions HFT_SIMD_SCALAR_ONLY)
+elseif(HFT_SIMD STREQUAL "SSE2")
+  list(APPEND _hft_simd_definitions HFT_SIMD_DISABLE_AVX2)
+endif()
+message(STATUS "HFT SIMD ceiling: ${HFT_SIMD} (runtime backend selection remains authoritative)")
 
 set(_hft_tree_source "${CMAKE_CURRENT_SOURCE_DIR}/src/cache_tree.cpp")
 set(_hft_simd_source "${CMAKE_CURRENT_SOURCE_DIR}/src/simd_search.cpp")
 if(EXISTS "${_hft_tree_source}" AND EXISTS "${_hft_simd_source}")
   add_library(hft_cache "${_hft_tree_source}" "${_hft_simd_source}")
   target_link_libraries(hft_cache PUBLIC hft_build_options)
-  target_compile_definitions(hft_cache PUBLIC "HFT_SIMD_DEFAULT=${HFT_SIMD}")
+  target_compile_definitions(hft_cache PUBLIC "HFT_SIMD_DEFAULT=${HFT_SIMD}"
+                             PRIVATE ${_hft_simd_definitions})
   target_include_directories(hft_cache PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
   set_target_properties(hft_cache PROPERTIES CXX_EXTENSIONS OFF)
+elseif(BUILD_TESTING)
+  message(FATAL_ERROR
+    "BUILD_TESTING is enabled but the library sources are missing: "
+    "${_hft_tree_source} and/or ${_hft_simd_source}.")
 else()
   message(STATUS "Skipping hft_cache: src/cache_tree.cpp and/or src/simd_search.cpp not yet available")
 endif()
 
 if(BUILD_TESTING)
-  if(TARGET hft_cache AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cache_tree.cpp")
-    add_executable(hft_tests tests/test_cache_tree.cpp)
-    target_link_libraries(hft_tests PRIVATE hft_cache)
-    set_target_properties(hft_tests PROPERTIES CXX_EXTENSIONS OFF)
-    add_test(NAME hft_tests COMMAND hft_tests)
-  else()
-    message(STATUS "Skipping hft_tests: library and/or tests/test_cache_tree.cpp not yet available")
+  if(NOT TARGET hft_cache)
+    message(FATAL_ERROR "BUILD_TESTING is enabled but the hft_cache library is unavailable.")
+  endif()
+  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cache_tree.cpp")
+    message(FATAL_ERROR
+      "BUILD_TESTING is enabled but tests/test_cache_tree.cpp is missing.")
+  endif()
+  add_executable(hft_tests tests/test_cache_tree.cpp)
+  target_link_libraries(hft_tests PRIVATE hft_cache)
+  set_target_properties(hft_tests PROPERTIES CXX_EXTENSIONS OFF)
+  add_test(NAME hft_tests COMMAND hft_tests)
+  if(HFT_ENABLE_SANITIZERS)
+    set_tests_properties(hft_tests PROPERTIES
+      ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1;ASAN_OPTIONS=detect_leaks=1")
   endif()
 endif()
 

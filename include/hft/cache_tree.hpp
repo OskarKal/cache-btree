@@ -37,6 +37,14 @@ private:
     static constexpr std::size_t capacity_ = (line_size_ - 8) / 8;
     static_assert(capacity_ >= 3 && capacity_ <= 0x7fffffffu,
                   "CacheTree node capacity is not representable");
+    // keys starts after the 4-byte metadata and runs to the end of the node, so
+    // this many int32_t are readable (and zero-initialized) from keys onward.
+    // SIMD searches may load a full vector past count() as long as lanes at or
+    // beyond count() are masked, which is what makes vectorization possible
+    // when capacity_ is smaller than the vector width (e.g. 7 keys at 64 B).
+    static constexpr std::size_t readable_keys_ = (line_size_ - 4) / 4;
+    static_assert(readable_keys_ >= capacity_,
+                  "Node key storage must cover the key capacity");
 
     static constexpr std::uint32_t leaf_flag_ = 0x80000000u;
     static constexpr std::uint32_t count_mask_ = 0x7fffffffu;
@@ -56,6 +64,13 @@ private:
     };
     static_assert(sizeof(Node) == line_size_, "CacheTree node must occupy one cache line");
     static_assert(alignof(Node) == line_size_, "CacheTree node alignment must match the cache line");
+    static_assert(offsetof(Node, keys) == 4,
+                  "SIMD readable_keys_ assumes keys begins after the 4-byte metadata");
+    static_assert(offsetof(Node, keys) + readable_keys_ * sizeof(std::int32_t) <= sizeof(Node),
+                  "SIMD loads must stay inside the node");
+
+    // Test-only access to node storage for validate() fault injection.
+    friend struct CacheTreeTestAccess;
 
     struct PathEntry {
         std::int32_t index;

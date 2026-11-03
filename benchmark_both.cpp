@@ -47,7 +47,10 @@ Options parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help") {
-            std::cout << "Usage: hft_bench --output PATH [--distribution uniform|zipf] [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N] [--build-flags TEXT]\n";
+            std::cout << "Usage: hft_bench --output PATH [--distribution uniform|zipf] [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N] [--build-flags TEXT]\n"
+                         "\n"
+                         "--distribution zipf uses a fixed exponent alpha = 1.5.\n"
+                         "--seed accepts 0. Timings are phase totals in milliseconds, not per-operation.\n";
             std::exit(0);
         }
         if (++i == argc) throw std::invalid_argument("missing value for " + arg);
@@ -59,7 +62,7 @@ Options parse(int argc, char** argv) {
         else if (arg == "--ranges") o.ranges = number(val, 10000000);
         else if (arg == "--updates") o.updates = number(val, 100000000);
         else if (arg == "--runs") o.runs = number(val, 10000);
-        else if (arg == "--seed") o.seed = static_cast<std::uint32_t>(number(val, UINT32_MAX));
+        else if (arg == "--seed") o.seed = static_cast<std::uint32_t>(number(val, UINT32_MAX, true));
         else if (arg == "--build-flags") o.flags = val;
         else throw std::invalid_argument("unknown option: " + arg);
     }
@@ -174,34 +177,57 @@ std::string compiler() {
 } // namespace
 
 int main(int argc, char** argv) {
+    std::FILE* file = nullptr;
+    std::string output;
+    bool created = false;
     try {
         const Options o = parse(argc, argv);
+        output = o.output;
+        // C11 exclusive create: fail before the long run if the path exists or
+        // the parent directory is missing, and never truncate an artifact.
+        file = std::fopen(o.output.c_str(), "wx");
+        if (!file) throw std::runtime_error("cannot create output (already exists or parent directory missing): " + o.output);
+        created = true;
         const Workload w = generate(o);
         std::ostringstream out;
         out << std::setprecision(12);
         out << "record,cpu,compiler,build_flags,line_bytes,available_sse2,available_avx2,distribution,zipf_alpha,seed,insert_ops,distinct_keys,lookup_ops,range_ops,update_ops,backend,run,insert_ms,lookup_ms,range_ms,update_ms,checksum\n";
         const auto prefix = csv(cpu()) + "," + csv(compiler()) + "," + csv(o.flags) + "," + std::to_string(HFT_CACHE_LINE_SIZE) + "," + std::to_string(hft::backend_available(hft::Backend::SSE2)) + "," + std::to_string(hft::backend_available(hft::Backend::AVX2)) + "," + o.distribution + "," + (o.distribution == "zipf" ? "1.5" : "") + "," + std::to_string(o.seed) + "," + std::to_string(o.keys) + "," + std::to_string(w.initial.size()) + "," + std::to_string(o.lookups) + "," + std::to_string(o.ranges) + "," + std::to_string(o.updates) + ",";
+        std::vector<hft::Backend> modes;
         for (auto mode : {hft::Backend::Scalar, hft::Backend::SSE2, hft::Backend::AVX2}) {
             if (!hft::backend_available(mode)) { std::cout << "Skipping unavailable " << hft::backend_name(mode) << '\n'; continue; }
-            run(mode, w); // untimed warmup, including correctness checks
-            std::vector<double> ins, look, ranges, updates;
-            for (std::size_t i = 0; i < o.runs; ++i) {
-                const auto s = run(mode, w);
-                ins.push_back(s.insert); look.push_back(s.lookup); ranges.push_back(s.range); updates.push_back(s.update);
-                out << "sample," << prefix << csv(hft::backend_name(mode)) << ',' << i + 1 << ',' << s.insert << ',' << s.lookup << ',' << s.range << ',' << s.update << ',' << s.checksum << '\n';
-            }
-            out << "median," << prefix << csv(hft::backend_name(mode)) << ",," << median(ins) << ',' << median(look) << ',' << median(ranges) << ',' << median(updates) << ",\n";
-            std::cout << hft::backend_name(mode) << " median ms: insert " << median(ins) << ", lookup " << median(look) << ", range " << median(ranges) << ", update " << median(updates) << '\n';
+            modes.push_back(mode);
         }
-        // C11 exclusive create: never truncate an existing artifact, even after a race.
-        std::FILE* file = std::fopen(o.output.c_str(), "wx");
-        if (!file) throw std::runtime_error("cannot create output (already exists or parent directory missing): " + o.output);
+        for (auto mode : modes) run(mode, w); // untimed warmup, including correctness checks
+        const std::size_t count = modes.size();
+        std::vector<std::vector<double>> ins(count), look(count), ranges(count), updates(count);
+        // Rotate the backend order each run so drift does not consistently favor
+        // one backend; report the median of each backend's runs.
+        for (std::size_t i = 0; i < o.runs; ++i) {
+            for (std::size_t k = 0; k < count; ++k) {
+                const std::size_t index = (i + k) % count;
+                const auto s = run(modes[index], w);
+                ins[index].push_back(s.insert); look[index].push_back(s.lookup); ranges[index].push_back(s.range); updates[index].push_back(s.update);
+                out << "sample," << prefix << csv(hft::backend_name(modes[index])) << ',' << i + 1 << ',' << s.insert << ',' << s.lookup << ',' << s.range << ',' << s.update << ',' << s.checksum << '\n';
+            }
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            const double insert = median(ins[index]);
+            const double lookup = median(look[index]);
+            const double range = median(ranges[index]);
+            const double update = median(updates[index]);
+            out << "median," << prefix << csv(hft::backend_name(modes[index])) << ",," << insert << ',' << lookup << ',' << range << ',' << update << ",\n";
+            std::cout << hft::backend_name(modes[index]) << " median ms: insert " << insert << ", lookup " << lookup << ", range " << range << ", update " << update << '\n';
+        }
         const std::string data = out.str();
         const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();
         const bool closed = std::fclose(file) == 0;
+        file = nullptr;
         if (!ok || !closed) throw std::runtime_error("failed writing output: " + o.output);
         std::cout << "Saved " << o.output << '\n';
     } catch (const std::exception& e) {
+        if (file) { std::fclose(file); file = nullptr; }
+        if (created) std::remove(output.c_str());
         std::cerr << "benchmark: " << e.what() << '\n'; return 1;
     }
 }

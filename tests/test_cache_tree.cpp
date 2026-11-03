@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Run this same executable in separate 32-, 64-, and 128-byte CMake
@@ -26,6 +27,32 @@
 #ifndef HFT_CACHE_LINE_SIZE
 #error "The library configuration must provide HFT_CACHE_LINE_SIZE"
 #endif
+
+// Test-only access to private node storage. The library declares this struct a
+// friend; production code cannot reach these internals. It exists so validate()
+// can be checked against deliberately corrupted trees instead of serving as its
+// own oracle.
+namespace hft {
+struct CacheTreeTestAccess {
+    static CacheTree::Node& node(CacheTree& tree, std::size_t index) {
+        return tree.nodes_[index];
+    }
+    static const CacheTree::Node& node(const CacheTree& tree, std::size_t index) {
+        return tree.nodes_[index];
+    }
+    static std::size_t node_count(const CacheTree& tree) { return tree.nodes_.size(); }
+    static std::size_t& size(CacheTree& tree) { return tree.size_; }
+    static std::size_t capacity() { return CacheTree::capacity_; }
+    static std::size_t first_leaf(const CacheTree& tree, std::size_t min_keys) {
+        for (std::size_t i = 0; i < tree.nodes_.size(); ++i) {
+            if (tree.nodes_[i].is_leaf() && tree.nodes_[i].count() >= min_keys) {
+                return i;
+            }
+        }
+        return tree.nodes_.size();
+    }
+};
+} // namespace hft
 
 namespace {
 using Key = std::int32_t;
@@ -337,6 +364,169 @@ void randomized_operations(const std::vector<Backend>& modes, std::uint32_t seed
     }
     trees.complete();
 }
+
+std::size_t model_lower(const std::vector<Key>& keys, std::size_t count, Key needle) {
+    return static_cast<std::size_t>(
+        std::lower_bound(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(count), needle) -
+        keys.begin());
+}
+
+std::size_t model_upper(const std::vector<Key>& keys, std::size_t count, Key needle) {
+    return static_cast<std::size_t>(
+        std::upper_bound(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(count), needle) -
+        keys.begin());
+}
+
+void backend_resolution() {
+    context = "backend resolution";
+    Backend best = Backend::Scalar;
+    if (hft::backend_available(Backend::SSE2)) best = Backend::SSE2;
+    if (hft::backend_available(Backend::AVX2)) best = Backend::AVX2;
+    require(hft::resolve_backend(Backend::Auto) == best,
+            "Auto did not resolve to the highest available backend");
+    require(hft::resolve_backend(Backend::Scalar) == Backend::Scalar,
+            "Scalar did not resolve to itself");
+    for (Backend backend : {Backend::SSE2, Backend::AVX2}) {
+        if (hft::backend_available(backend)) {
+            require(hft::resolve_backend(backend) == backend,
+                    std::string("forced backend did not resolve to itself: ") + name(backend));
+            continue;
+        }
+        bool rejected = false;
+        try {
+            (void)hft::resolve_backend(backend);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        require(rejected, std::string("resolve_backend accepted unavailable backend: ") +
+                              name(backend));
+    }
+}
+
+// Directly exercises the search primitive, independent of tree capacity. Lengths
+// 0..33 cover every vector group and tail for SSE2 (4 lanes) and AVX2 (8 lanes),
+// including lengths that the 64-byte tree layout (capacity 7) never produces.
+void search_primitives() {
+    context = "search primitives";
+    std::vector<Backend> modes{Backend::Auto, Backend::Scalar};
+    for (Backend backend : {Backend::SSE2, Backend::AVX2}) {
+        if (hft::backend_available(backend)) modes.push_back(backend);
+    }
+
+    std::vector<Key> needles;
+    for (Key key = -40; key <= 40; ++key) needles.push_back(key);
+    needles.insert(needles.end(), {kMin, Key{kMin + 1}, Key{0}, Key{kMax - 1}, kMax});
+
+    constexpr std::size_t max_length = 33;
+    constexpr std::size_t padding = 8;
+    for (std::size_t length = 0; length <= max_length; ++length) {
+        for (int pattern = 0; pattern != 5; ++pattern) {
+            // Extra lanes are initialized with extrema that would change the
+            // answer if a backend failed to mask them out.
+            std::vector<Key> keys(length + padding, Key{0});
+            for (std::size_t i = 0; i < length; ++i) {
+                switch (pattern) {
+                    case 0: // strictly ascending
+                        keys[i] = static_cast<Key>(i) * 2 - 30;
+                        break;
+                    case 1: // all equal
+                        keys[i] = 7;
+                        break;
+                    case 2: // groups of duplicates
+                        keys[i] = static_cast<Key>(i / 3) - 5;
+                        break;
+                    case 3: // two blocks with duplicate boundaries
+                        keys[i] = i < length / 2 ? Key{-1} : Key{1};
+                        break;
+                    default: // signed extrema at both ends
+                        keys[i] = i == 0 ? kMin : (i == length - 1 ? kMax
+                                                                   : static_cast<Key>(i - 1));
+                        break;
+                }
+            }
+            for (std::size_t i = length; i < keys.size(); ++i) {
+                keys[i] = i % 2 == 0 ? kMin : kMax;
+            }
+            for (Backend mode : modes) {
+                const Backend resolved = hft::resolve_backend(mode);
+                for (std::size_t room : {std::size_t{0}, length + padding}) {
+                    for (Key needle : needles) {
+                        const std::size_t expected_lower = model_lower(keys, length, needle);
+                        const std::size_t expected_upper = model_upper(keys, length, needle);
+                        context = "primitive lower length=" + std::to_string(length) +
+                                  " pattern=" + std::to_string(pattern) + " backend=" +
+                                  name(mode) + " room=" + std::to_string(room) +
+                                  " needle=" + std::to_string(needle);
+                        require(hft::lower_bound(keys.data(), length, needle, mode, room) ==
+                                    expected_lower,
+                                "lower_bound mismatch");
+                        require(hft::lower_bound_resolved(keys.data(), length, needle, resolved,
+                                                          room) == expected_lower,
+                                "lower_bound_resolved mismatch");
+                        require(hft::upper_bound(keys.data(), length, needle, mode, room) ==
+                                    expected_upper,
+                                "upper_bound mismatch");
+                        require(hft::upper_bound_resolved(keys.data(), length, needle, resolved,
+                                                          room) == expected_upper,
+                                "upper_bound_resolved mismatch");
+                    }
+                }
+            }
+        }
+    }
+}
+
+void validate_fault_injection() {
+    context = "validate fault injection";
+    const std::size_t capacity = hft::CacheTreeTestAccess::capacity();
+    CacheTree tree;
+    const auto key_count = static_cast<Key>(4 * capacity + 10);
+    for (Key key = 0; key < key_count; ++key) {
+        tree.insert(key * 2, key);
+    }
+    require(tree.validate(), "baseline tree failed validate()");
+    require(hft::CacheTreeTestAccess::node_count(tree) > 2, "expected a multi-node tree");
+
+    {
+        context = "validate: count above capacity";
+        CacheTree copy = tree;
+        auto& root = hft::CacheTreeTestAccess::node(copy, 0);
+        root.metadata = (root.metadata & 0x80000000u) |
+                        static_cast<std::uint32_t>(capacity + 1);
+        require(!copy.validate(), "validate accepted count above capacity");
+    }
+    {
+        context = "validate: entry count mismatch";
+        CacheTree copy = tree;
+        ++hft::CacheTreeTestAccess::size(copy);
+        require(!copy.validate(), "validate accepted a wrong size_");
+    }
+    {
+        context = "validate: unsorted leaf keys";
+        CacheTree copy = tree;
+        const std::size_t leaf = hft::CacheTreeTestAccess::first_leaf(copy, 2);
+        require(leaf < hft::CacheTreeTestAccess::node_count(copy), "no leaf with two keys");
+        auto& node = hft::CacheTreeTestAccess::node(copy, leaf);
+        std::swap(node.keys[0], node.keys[1]);
+        require(!copy.validate(), "validate accepted unsorted leaf keys");
+    }
+    {
+        context = "validate: broken leaf chain";
+        CacheTree copy = tree;
+        const std::size_t leaf = hft::CacheTreeTestAccess::first_leaf(copy, 1);
+        require(leaf < hft::CacheTreeTestAccess::node_count(copy), "no leaf found");
+        hft::CacheTreeTestAccess::node(copy, leaf).slots[capacity] = 0;
+        require(!copy.validate(), "validate accepted a broken leaf link");
+    }
+    {
+        context = "validate: invalid child slot";
+        CacheTree copy = tree;
+        auto& root = hft::CacheTreeTestAccess::node(copy, 0);
+        require(!root.is_leaf(), "expected an internal root");
+        root.slots[0] = 0; // child index zero is reserved and must be rejected
+        require(!copy.validate(), "validate accepted a reserved child index");
+    }
+}
 } // namespace
 
 int main() {
@@ -351,7 +541,10 @@ int main() {
         for (Backend mode : modes) {
             std::cout << "Testing backend=" << name(mode) << '\n';
         }
+        backend_resolution();
+        search_primitives();
         default_constructor();
+        validate_fault_injection();
         empty_and_extrema(modes);
         partial_nodes_and_splits(modes);
         ordered_insertions(modes);
