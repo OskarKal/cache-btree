@@ -1,397 +1,233 @@
-#include "cacheB+tree.cpp"
-#include "ordinalB++tree.h"
-#include <chrono>
-#include <random>
-#include <iostream>
-#include <iomanip>
-#include <vector>
+#include <hft/cache_tree.hpp>
+#include <hft/simd_search.hpp>
+#include <hft/config.hpp>
+
 #include <algorithm>
-#include <fstream>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
-using namespace std;
-using namespace std::chrono;
-
-// Zipf distribution generator with rank-to-value mapping
-class ZipfDistribution {
-private:
-    double alpha;
-    int n;
-    double c;  // normalization constant
-    vector<int32_t> rankMap;  // maps rank -> actual key value
-    vector<double> cdf;  // cumulative distribution function for sampling
-    
-public:
-    ZipfDistribution(int _n, double _alpha, mt19937& rng) : n(_n), alpha(_alpha) {
-        // Create rank map: values 0 to n-1 shuffled
-        rankMap.resize(n);
-        for (int i = 0; i < n; i++) {
-            rankMap[i] = i;
-        }
-        shuffle(rankMap.begin(), rankMap.end(), rng);
-        
-        // Compute normalization constant
-        c = 0.0;
-        for (int i = 1; i <= n; i++) {
-            c += 1.0 / pow(i, alpha);
-        }
-        c = 1.0 / c;
-        // Precompute CDF for sampling
-        cdf.resize(n);
-        double cumulative = 0.0;
-        for (int i = 1; i <= n; i++) {
-            cumulative += c / pow(i, alpha);
-            cdf[i - 1] = cumulative;
-        }
-
-    }
-    
-    int32_t operator()(mt19937& rng) {
-        uniform_real_distribution<double> uniform(0.0, 1.0);
-        double z = uniform(rng);
-
-        
- 
-        // Binary search
-        int l = 0, r = n - 1;
-        while (l < r) {
-            int mid = l + (r - l) / 2;
-            if (cdf[mid] >= z) {
-                r = mid;
-            } else {
-                l = mid + 1;
-            }
-        }
-        return rankMap[l];
-
-    }
+namespace {
+using Clock = std::chrono::steady_clock;
+struct Options {
+    std::string output, distribution = "uniform", flags = "not supplied";
+    std::size_t keys = 10000, lookups = 20000, ranges = 300, updates = 2000, runs = 5;
+    std::uint32_t seed = 42;
 };
-
-struct BenchResult {
-    double insertTime;
-    double searchTime;
-    double rangeSearchTime;
-    double updateTime;
+struct Workload {
+    std::vector<int32_t> inserts, lookups, updates;
+    std::vector<std::pair<int32_t, int32_t>> ranges;
+    std::map<int32_t, int32_t> initial, updated;
 };
+struct Sample { double insert, lookup, range, update; std::uint64_t checksum; };
 
-// 1~chmark CacheFriendlyBTree
-BenchResult benchmarkBPlusTree(const vector<int32_t>& insertKeys, 
-                               const vector<int32_t>& searchKeys,
-                               const vector<pair<int32_t, int32_t>>& rangeSearches,
-                               const vector<int32_t>& updateKeys) {
-    BPlusTree::CacheFriendlyBTree tree;
-    
-    // Insert benchmark
-    auto start = high_resolution_clock::now();
-    for (int32_t key : insertKeys) {
-        tree.insert(key, key * 2);
-    }
-    auto end = high_resolution_clock::now();
-    double insertTime = duration<double, milli>(end - start).count();
-    
-    // Search benchmark
-    start = high_resolution_clock::now();
-    volatile int32_t sum = 0;
-    for (int32_t key : searchKeys) {
-        int32_t val = tree.search(key);
-        if (val != -1) sum += val;
-    }
-    end = high_resolution_clock::now();
-    double searchTime = duration<double, milli>(end - start).count();
-    
-    // Range search benchmark
-    start = high_resolution_clock::now();
-    volatile int32_t rangeSum = 0;
-    for (const auto& range : rangeSearches) {
-        auto results = tree.range_search(range.first, range.second);
-        for (int32_t val : results) {
-            rangeSum += val;
+std::size_t number(const std::string& s, std::size_t max, bool allow_zero = false) {
+    if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos)
+        throw std::invalid_argument("expected an unsigned decimal integer: " + s);
+    const auto n = std::stoull(s);
+    if ((!allow_zero && n == 0) || n > max) throw std::invalid_argument("number out of range: " + s);
+    return static_cast<std::size_t>(n);
+}
+Options parse(int argc, char** argv) {
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help") {
+            std::cout << "Usage: hft_bench --output PATH [--distribution uniform|zipf] [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N] [--build-flags TEXT]\n"
+                         "\n"
+                         "--distribution zipf uses a fixed exponent alpha = 1.5.\n"
+                         "--seed accepts 0. Timings are phase totals in milliseconds, not per-operation.\n";
+            std::exit(0);
         }
+        if (++i == argc) throw std::invalid_argument("missing value for " + arg);
+        std::string val = argv[i];
+        if (arg == "--output") o.output = val;
+        else if (arg == "--distribution") o.distribution = val;
+        else if (arg == "--keys") o.keys = number(val, 10000000);
+        else if (arg == "--lookups") o.lookups = number(val, 100000000);
+        else if (arg == "--ranges") o.ranges = number(val, 10000000);
+        else if (arg == "--updates") o.updates = number(val, 100000000);
+        else if (arg == "--runs") o.runs = number(val, 10000);
+        else if (arg == "--seed") o.seed = static_cast<std::uint32_t>(number(val, UINT32_MAX, true));
+        else if (arg == "--build-flags") o.flags = val;
+        else throw std::invalid_argument("unknown option: " + arg);
     }
-    end = high_resolution_clock::now();
-    double rangeSearchTime = duration<double, milli>(end - start).count();
-    
-    // Update benchmark
-    start = high_resolution_clock::now();
-    for (int32_t key : updateKeys) {
-        tree.insert(key, key * 3);
-    }
-    end = high_resolution_clock::now();
-    double updateTime = duration<double, milli>(end - start).count();
-    
-    return {insertTime, searchTime, rangeSearchTime, updateTime};
+    if (o.output.empty()) throw std::invalid_argument("--output is required");
+    if (o.distribution != "uniform" && o.distribution != "zipf")
+        throw std::invalid_argument("distribution must be uniform or zipf");
+    return o;
 }
 
-// Benchmark Ordinal BPlusTree
-BenchResult benchmarkOrdinalTree(const vector<int32_t>& insertKeys, 
-                                 const vector<int32_t>& searchKeys,
-                                 const vector<pair<int32_t, int32_t>>& rangeSearches,
-                                 const vector<int32_t>& updateKeys) {
-    BPlusTree<int32_t> tree(7);  // degree 4 (similar branching to cache tree)
-    
-    // Insert benchmark
-    auto start = high_resolution_clock::now();
-    for (int32_t key : insertKeys) {
-        tree.insert(key);
+Workload generate(const Options& o) {
+    std::mt19937 rng(o.seed);
+    // Shuffle Zipf ranks so popular keys are not clustered in key order.
+    std::vector<int32_t> ranks(o.keys);
+    std::iota(ranks.begin(), ranks.end(), 0);
+    std::shuffle(ranks.begin(), ranks.end(), rng);
+    std::vector<double> cdf;
+    if (o.distribution == "zipf") {
+        cdf.resize(o.keys);
+        double total = 0;
+        for (std::size_t i = 0; i < o.keys; ++i) { total += 1.0 / std::pow(double(i + 1), 1.5); cdf[i] = total; }
+        for (double& x : cdf) x /= total;
+        cdf.back() = 1.0;
     }
-    auto end = high_resolution_clock::now();
-    double insertTime = duration<double, milli>(end - start).count();
-    
-    // Search benchmark
-    start = high_resolution_clock::now();
-    volatile bool found = false;
-    for (int32_t key : searchKeys) {
-        found = tree.search(key);
+    auto key = [&]() -> int32_t {
+        std::size_t rank;
+        if (cdf.empty()) rank = std::uniform_int_distribution<std::size_t>(0, o.keys - 1)(rng);
+        else rank = std::lower_bound(cdf.begin(), cdf.end(), std::generate_canonical<double, 53>(rng)) - cdf.begin();
+        return ranks[rank] * 2; // odd keys are guaranteed misses; bounded by --keys
+    };
+    Workload w;
+    for (std::size_t i = 0; i < o.keys; ++i) {
+        int32_t k = key(); w.inserts.push_back(k); w.initial[k] = k + 1;
     }
-    end = high_resolution_clock::now();
-    double searchTime = duration<double, milli>(end - start).count();
-    
-    // Range search benchmark
-    start = high_resolution_clock::now();
-    volatile int32_t rangeSum = 0;
-    for (const auto& range : rangeSearches) {
-            // Allocate enough space for results
-            auto results = tree.range_search(range.first, range.second, 10000);
-        for (int32_t val : results) {
-            rangeSum += val;
-        }
+    std::uniform_int_distribution<std::size_t> pick(0, w.inserts.size() - 1);
+    for (std::size_t i = 0; i < o.lookups; ++i) {
+        const int32_t k = w.inserts[pick(rng)];
+        w.lookups.push_back(k + static_cast<int32_t>(i % 2));
     }
-    end = high_resolution_clock::now();
-    double rangeSearchTime = duration<double, milli>(end - start).count();
-    
-    // Update benchmark
-    start = high_resolution_clock::now();
-    for (int32_t key : updateKeys) {
-        tree.insert(key);
+    constexpr int32_t lengths[] = {1, 8, 64};
+    for (std::size_t i = 0; i < o.ranges; ++i)
+        w.ranges.emplace_back(w.inserts[pick(rng)] + static_cast<int32_t>(i % 2), lengths[i % 3]);
+    w.updated = w.initial;
+    for (std::size_t i = 0; i < o.updates; ++i) {
+        const int32_t k = w.inserts[pick(rng)]; w.updates.push_back(k); w.updated[k] = -k - 1;
     }
-    end = high_resolution_clock::now();
-    double updateTime = duration<double, milli>(end - start).count();
-    
-    return {insertTime, searchTime, rangeSearchTime, updateTime};
+    return w;
 }
+std::vector<int32_t> expected_range(const std::map<int32_t, int32_t>& m, int32_t start, int32_t length) {
+    std::vector<int32_t> result;
+    for (auto it = m.lower_bound(start); it != m.end() && result.size() < static_cast<std::size_t>(length); ++it)
+        result.push_back(it->second);
+    return result;
+}
+void verify(const hft::CacheTree& tree, const Workload& w, const std::map<int32_t, int32_t>& reference) {
+    if (tree.size() != reference.size() || !tree.validate()) throw std::runtime_error("tree size or structure mismatch");
+    for (const auto& kv : reference)
+        if (tree.find(kv.first) != kv.second) throw std::runtime_error("stored value mismatch");
+    for (int32_t k : w.lookups) {
+        auto it = reference.find(k); auto actual = tree.find(k);
+        if ((it == reference.end()) != !actual || (actual && *actual != it->second))
+            throw std::runtime_error("lookup mismatch");
+    }
+    for (const auto& r : w.ranges)
+        if (tree.range_search(r.first, r.second) != expected_range(reference, r.first, r.second))
+            throw std::runtime_error("range mismatch");
+}
+template<class F> double timed(F f) {
+    auto start = Clock::now(); f();
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+Sample run(hft::Backend backend, const Workload& w) {
+    hft::CacheTree tree(backend);
+    if (tree.backend() != backend) throw std::runtime_error("requested backend was not selected");
+    Sample s{};
+    s.insert = timed([&] { for (int32_t k : w.inserts) tree.insert(k, k + 1); });
+    verify(tree, w, w.initial);
+    s.lookup = timed([&] { for (int32_t k : w.lookups) { auto v = tree.find(k); if (v) s.checksum += static_cast<std::uint32_t>(*v); } });
+    s.range = timed([&] { for (const auto& r : w.ranges) for (int32_t v : tree.range_search(r.first, r.second)) s.checksum += static_cast<std::uint32_t>(v); });
+    s.update = timed([&] { for (int32_t k : w.updates) tree.insert(k, -k - 1); });
+    verify(tree, w, w.updated);
+    return s;
+}
+double median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    auto n = v.size();
+    return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+}
+std::string csv(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) { if (c == '"') out += '"'; out += c; }
+    return out + '"';
+}
+std::string cpu() {
+    std::ifstream in("/proc/cpuinfo"); std::string line;
+    while (std::getline(in, line)) {
+        auto p = line.find(':');
+        if (p != std::string::npos && (line.find("model name") == 0 || line.find("Hardware") == 0)) return line.substr(p + 1);
+    }
+    return "unknown";
+}
+std::string compiler() {
+#if defined(__clang__)
+    return std::string("Clang ") + __clang_version__;
+#elif defined(__GNUC__)
+    return std::string("GCC ") + __VERSION__;
+#elif defined(_MSC_VER)
+    return "MSVC " + std::to_string(_MSC_VER);
+#else
+    return "unknown";
+#endif
+}
+} // namespace
 
 int main(int argc, char** argv) {
-    string distribution = "uniform";  // default distribution
-    double zipf_alpha = 1.5;  // default Zipf exponent
-    
-    // Parse command-line arguments
-    if (argc > 1) {
-        distribution = argv[1];
-    }
-    if (argc > 2) {
-        zipf_alpha = stod(argv[2]);
-    }
-    
-    // Validate distribution
-    if (distribution != "uniform" && distribution != "zipf") {
-        cout << "Usage: " << argv[0] << " [uniform|zipf] [zipf_alpha]" << endl;
-        cout << "  uniform  - uniform distribution (default)" << endl;
-        cout << "  zipf     - Zipf distribution (use with alpha parameter)" << endl;
-        cout << "  alpha    - Zipf exponent (default: 1.5, higher = more skewed)" << endl;
-        return 1;
-    }
-    
-    const vector<int> OP_SIZES = {10000, 50000, 100000, 250000, 500000};
-    const int NUM_RUNS = 10;
-    
-    // Open CSV file
-    ofstream csvFile("benchmark_comparison.csv");
-    csvFile << "distribution,alpha,operations,tree_type,inserts,searches,range_searches,updates,insert_ms,search_ms,range_search_ms,update_ms,total_ms,insert_Mops_sec,search_Mops_sec,range_search_Mops_sec,update_Mops_sec\n";
-    
-    cout << "=== B+ Tree Comparison: Cache vs Ordinal ===" << endl;
-    cout << "Distribution: " << distribution;
-    if (distribution == "zipf") {
-        cout << " (alpha=" << fixed << setprecision(2) << zipf_alpha << ")";
-    }
-    cout << endl;
-    cout << "Runs per config: " << NUM_RUNS << " iterations (median reported)" << endl;
-    cout << "Results will be saved to: benchmark_comparison.csv" << endl;
-    cout << "\nWarming up CPU..." << endl;
-    
-    // Warmup
-    BPlusTree::CacheFriendlyBTree warmBPlusTree;
-    for (int j = 0; j < 5000; j++) {
-        warmBPlusTree.insert(j, j);
-        warmBPlusTree.search(j / 2);
-    }
-    
-    BPlusTree<int32_t> warmOrdinalTree(4);
-    for (int j = 0; j < 5000; j++) {
-        warmOrdinalTree.insert(j);
-        warmOrdinalTree.search(j / 2);
-    }
-    
-    // Benchmark different sizes
-    for (int NUM_OPS : OP_SIZES) {
-        int NUM_SEARCHES = NUM_OPS * 5;
-        int NUM_RANGE_SEARCHES = NUM_OPS / 20;  // Fewer range searches as they're more expensive
-        int NUM_UPDATES = NUM_OPS / 10;
-        
-        cout << "\n========================================" << endl;
-        cout << "Testing with " << NUM_OPS << " operations" << endl;
-        cout << "  Inserts: " << NUM_OPS << endl;
-        cout << "  Searches: " << NUM_SEARCHES << endl;
-        cout << "  Range Searches: " << NUM_RANGE_SEARCHES << endl;
-        cout << "  Updates: " << NUM_UPDATES << endl;
-        cout << "========================================" << endl;
-        
-        // Generate test data (same for both trees)
-        mt19937 rng(42);
-        uniform_int_distribution<int32_t> uniform_dist(0, NUM_OPS * 10);
-        ZipfDistribution zipf_dist(NUM_OPS * 10, zipf_alpha, rng);
-        
-        vector<int32_t> insertKeys(NUM_OPS);
-        for (int i = 0; i < NUM_OPS; i++) {
-            if (distribution == "uniform") {
-                insertKeys[i] = uniform_dist(rng);
-            } else {
-                insertKeys[i] = zipf_dist(rng);
+    std::FILE* file = nullptr;
+    std::string output;
+    bool created = false;
+    try {
+        const Options o = parse(argc, argv);
+        output = o.output;
+        // C11 exclusive create: fail before the long run if the path exists or
+        // the parent directory is missing, and never truncate an artifact.
+        file = std::fopen(o.output.c_str(), "wx");
+        if (!file) throw std::runtime_error("cannot create output (already exists or parent directory missing): " + o.output);
+        created = true;
+        const Workload w = generate(o);
+        std::ostringstream out;
+        out << std::setprecision(12);
+        out << "record,cpu,compiler,build_flags,line_bytes,available_sse2,available_avx2,distribution,zipf_alpha,seed,insert_ops,distinct_keys,lookup_ops,range_ops,update_ops,backend,run,insert_ms,lookup_ms,range_ms,update_ms,checksum\n";
+        const auto prefix = csv(cpu()) + "," + csv(compiler()) + "," + csv(o.flags) + "," + std::to_string(HFT_CACHE_LINE_SIZE) + "," + std::to_string(hft::backend_available(hft::Backend::SSE2)) + "," + std::to_string(hft::backend_available(hft::Backend::AVX2)) + "," + o.distribution + "," + (o.distribution == "zipf" ? "1.5" : "") + "," + std::to_string(o.seed) + "," + std::to_string(o.keys) + "," + std::to_string(w.initial.size()) + "," + std::to_string(o.lookups) + "," + std::to_string(o.ranges) + "," + std::to_string(o.updates) + ",";
+        std::vector<hft::Backend> modes;
+        for (auto mode : {hft::Backend::Scalar, hft::Backend::SSE2, hft::Backend::AVX2}) {
+            if (!hft::backend_available(mode)) { std::cout << "Skipping unavailable " << hft::backend_name(mode) << '\n'; continue; }
+            modes.push_back(mode);
+        }
+        for (auto mode : modes) run(mode, w); // untimed warmup, including correctness checks
+        const std::size_t count = modes.size();
+        std::vector<std::vector<double>> ins(count), look(count), ranges(count), updates(count);
+        // Rotate the backend order each run so drift does not consistently favor
+        // one backend; report the median of each backend's runs.
+        for (std::size_t i = 0; i < o.runs; ++i) {
+            for (std::size_t k = 0; k < count; ++k) {
+                const std::size_t index = (i + k) % count;
+                const auto s = run(modes[index], w);
+                ins[index].push_back(s.insert); look[index].push_back(s.lookup); ranges[index].push_back(s.range); updates[index].push_back(s.update);
+                out << "sample," << prefix << csv(hft::backend_name(modes[index])) << ',' << i + 1 << ',' << s.insert << ',' << s.lookup << ',' << s.range << ',' << s.update << ',' << s.checksum << '\n';
             }
         }
-        
-        vector<int32_t> searchKeys(NUM_SEARCHES);
-        for (int i = 0; i < NUM_SEARCHES; i++) {
-            searchKeys[i] = insertKeys[rng() % NUM_OPS];
+        for (std::size_t index = 0; index < count; ++index) {
+            const double insert = median(ins[index]);
+            const double lookup = median(look[index]);
+            const double range = median(ranges[index]);
+            const double update = median(updates[index]);
+            out << "median," << prefix << csv(hft::backend_name(modes[index])) << ",," << insert << ',' << lookup << ',' << range << ',' << update << ",\n";
+            std::cout << hft::backend_name(modes[index]) << " median ms: insert " << insert << ", lookup " << lookup << ", range " << range << ", update " << update << '\n';
         }
-        
-        // Generate range search pairs with geometric distribution for range sizes
-        vector<pair<int32_t, int32_t>> rangeSearches(NUM_RANGE_SEARCHES);
-        geometric_distribution<int> geom_dist(0.5);  // Expected range size ~1 item
-        for (int i = 0; i < NUM_RANGE_SEARCHES; i++) {
-            int32_t start = insertKeys[rng() % NUM_OPS];
-            int32_t length = geom_dist(rng) + 1;  // At least 1
-            rangeSearches[i] = {start, length};
-        }
-        
-        vector<int32_t> updateKeys(NUM_UPDATES);
-        for (int i = 0; i < NUM_UPDATES; i++) {
-            updateKeys[i] = insertKeys[rng() % NUM_OPS];
-        }
-        
-        // Benchmark BPlusTree
-        cout << "\nBenchmarking CacheFriendlyBTree..." << endl;
-        vector<BenchResult> cacheResults;
-        for (int run = 0; run < NUM_RUNS; run++) {
-            auto result = benchmarkBPlusTree(insertKeys, searchKeys, rangeSearches, updateKeys);
-            cacheResults.push_back(result);
-            cout << "  Run " << setw(2) << (run + 1) << ": Insert=" << fixed << setprecision(2) 
-                 << setw(8) << result.insertTime << "ms, Search=" << setw(8) << result.searchTime 
-                 << "ms, RangeSearch=" << setw(8) << result.rangeSearchTime << "ms, Update=" << setw(7) << result.updateTime << "ms" << endl;
-        }
-        
-        // Benchmark OrdinalTree
-        // cout << "\nBenchmarking Ordinal BPlusTree..." << endl;
-        // vector<BenchResult> ordinalResults;
-        // for (int run = 0; run < NUM_RUNS; run++) {
-        //     auto result = benchmarkOrdinalTree(insertKeys, searchKeys, rangeSearches, updateKeys);
-        //     ordinalResults.push_back(result);
-        //     cout << "  Run " << setw(2) << (run + 1) << ": Insert=" << fixed << setprecision(2) 
-        //          << setw(8) << result.insertTime << "ms, Search=" << setw(8) << result.searchTime 
-        //          << "ms, RangeSearch=" << setw(8) << result.rangeSearchTime << "ms, Update=" << setw(7) << result.updateTime << "ms" << endl;
-        // }
-        
-        // Calculate medians
-        auto getMedian = [](vector<double>& v) {
-            sort(v.begin(), v.end());
-            return v[v.size() / 2];
-        };
-        
-        // Cache tree medians
-        vector<double> cacheInserts, cacheSearches, cacheRangeSearches, cacheUpdates;
-        for (const auto& r : cacheResults) {
-            cacheInserts.push_back(r.insertTime);
-            cacheSearches.push_back(r.searchTime);
-            cacheRangeSearches.push_back(r.rangeSearchTime);
-            cacheUpdates.push_back(r.updateTime);
-        }
-        
-        // Ordinal tree medians
-        // vector<double> ordinalInserts, ordinalSearches, ordinalRangeSearches, ordinalUpdates;
-        // for (const auto& r : ordinalResults) {
-        //     ordinalInserts.push_back(r.insertTime);
-        //     ordinalSearches.push_back(r.searchTime);
-        //     ordinalRangeSearches.push_back(r.rangeSearchTime);
-        //     ordinalUpdates.push_back(r.updateTime);
-        // }
-        
-        double cacheInsertMedian = getMedian(cacheInserts);
-        double cacheSearchMedian = getMedian(cacheSearches);
-        double cacheRangeSearchMedian = getMedian(cacheRangeSearches);
-        double cacheUpdateMedian = getMedian(cacheUpdates);
-        
-        // double ordinalInsertMedian = getMedian(ordinalInserts);
-        // double ordinalSearchMedian = getMedian(ordinalSearches);
-        // double ordinalRangeSearchMedian = getMedian(ordinalRangeSearches);
-        // double ordinalUpdateMedian = getMedian(ordinalUpdates);
-        
-        // Write to CSV
-        auto writeCSV = [&](const string& treeType, double insertMs, double searchMs, double rangeSearchMs, double updateMs) {
-            csvFile << distribution << ",";
-            if (distribution == "zipf") {
-                csvFile << fixed << setprecision(2) << zipf_alpha << ",";
-            } else {
-                csvFile << "N/A,";
-            }
-            csvFile << NUM_OPS << "," 
-                    << treeType << "," 
-                    << NUM_OPS << "," 
-                    << NUM_SEARCHES << "," 
-                    << NUM_RANGE_SEARCHES << "," 
-                    << NUM_UPDATES << ","
-                    << fixed << setprecision(3) << insertMs << ","
-                    << searchMs << ","
-                    << rangeSearchMs << ","
-                    << updateMs << ","
-                    << (insertMs + searchMs + rangeSearchMs + updateMs) << ","
-                    << setprecision(4) << (NUM_OPS / insertMs * 1000.0 / 1000000.0) << ","
-                    << (NUM_SEARCHES / searchMs * 1000.0 / 1000000.0) << ","
-                    << (NUM_RANGE_SEARCHES / rangeSearchMs * 1000.0 / 1000000.0) << ","
-                    << (NUM_UPDATES / updateMs * 1000.0 / 1000000.0) << "\n";
-        };
-        
-        writeCSV("CacheFriendly", cacheInsertMedian, cacheSearchMedian, cacheRangeSearchMedian, cacheUpdateMedian);
-        // writeCSV("Ordinal", ordinalInsertMedian, ordinalSearchMedian, ordinalRangeSearchMedian, ordinalUpdateMedian);
-        
-        // Print results
-        cout << "\n--- MEDIAN RESULTS ---" << endl;
-        cout << fixed << setprecision(2);
-        cout << "\nCacheFriendlyBTree:" << endl;
-        cout << "  Insert:       " << setw(8) << cacheInsertMedian << " ms (" 
-             << setw(6) << setprecision(3) << (NUM_OPS / cacheInsertMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        cout << "  Search:       " << setw(8) << setprecision(2) << cacheSearchMedian << " ms (" 
-             << setw(6) << setprecision(3) << (NUM_SEARCHES / cacheSearchMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        cout << "  Range Search: " << setw(8) << setprecision(2) << cacheRangeSearchMedian << " ms (" 
-             << setw(6) << setprecision(3) << (NUM_RANGE_SEARCHES / cacheRangeSearchMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        cout << "  Update:       " << setw(8) << setprecision(2) << cacheUpdateMedian << " ms (" 
-             << setw(6) << setprecision(3) << (NUM_UPDATES / cacheUpdateMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        cout << "  Total:        " << setw(8) << setprecision(2) << (cacheInsertMedian + cacheSearchMedian + cacheRangeSearchMedian + cacheUpdateMedian) << " ms" << endl;
-        
-        // cout << "\nOrdinal BPlusTree:" << endl;
-        // cout << "  Insert:       " << setw(8) << ordinalInsertMedian << " ms (" 
-        //      << setw(6) << setprecision(3) << (NUM_OPS / ordinalInsertMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        // cout << "  Search:       " << setw(8) << setprecision(2) << ordinalSearchMedian << " ms (" 
-        //      << setw(6) << setprecision(3) << (NUM_SEARCHES / ordinalSearchMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        // cout << "  Range Search: " << setw(8) << setprecision(2) << ordinalRangeSearchMedian << " ms (" 
-        //      << setw(6) << setprecision(3) << (NUM_RANGE_SEARCHES / ordinalRangeSearchMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        // cout << "  Update:       " << setw(8) << setprecision(2) << ordinalUpdateMedian << " ms (" 
-        //      << setw(6) << setprecision(3) << (NUM_UPDATES / ordinalUpdateMedian * 1000.0 / 1000000.0) << " M ops/sec)" << endl;
-        // cout << "  Total:        " << setw(8) << setprecision(2) << (ordinalInsertMedian + ordinalSearchMedian + ordinalRangeSearchMedian + ordinalUpdateMedian) << " ms" << endl;
-        
-        // cout << "\n--- SPEEDUP (Cache vs Ordinal) ---" << endl;
-        // cout << "  Insert:       " << setprecision(2) << (ordinalInsertMedian / cacheInsertMedian) << "x faster" << endl;
-        // cout << "  Search:       " << (ordinalSearchMedian / cacheSearchMedian) << "x faster" << endl;
-        // cout << "  Range Search: " << (ordinalRangeSearchMedian / cacheRangeSearchMedian) << "x faster" << endl;
-        // cout << "  Update:       " << (ordinalUpdateMedian / cacheUpdateMedian) << "x faster" << endl;
-        // cout << "  Overall:      " << ((ordinalInsertMedian + ordinalSearchMedian + ordinalRangeSearchMedian + ordinalUpdateMedian) / 
-        //                                (cacheInsertMedian + cacheSearchMedian + cacheRangeSearchMedian + cacheUpdateMedian)) << "x faster" << endl;
+        const std::string data = out.str();
+        const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();
+        const bool closed = std::fclose(file) == 0;
+        file = nullptr;
+        if (!ok || !closed) throw std::runtime_error("failed writing output: " + o.output);
+        std::cout << "Saved " << o.output << '\n';
+    } catch (const std::exception& e) {
+        if (file) { std::fclose(file); file = nullptr; }
+        if (created) std::remove(output.c_str());
+        std::cerr << "benchmark: " << e.what() << '\n'; return 1;
     }
-    
-    csvFile.close();
-    cout << "\n========================================" << endl;
-    cout << "Benchmark complete!" << endl;
-    cout << "Results saved to: benchmark_comparison.csv" << endl;
-    cout << "========================================" << endl;
-    
-    return 0;
 }

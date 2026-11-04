@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        line: [32, 64, 128]
+        simd: [AUTO, SCALAR, SSE2, AVX2]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DHFT_CACHE_LINE_SIZE=${{ matrix.line }}
+          -DHFT_SIMD=${{ matrix.simd }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DHFT_CACHE_LINE_SIZE=64 -DHFT_ENABLE_SANITIZERS=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  benchmark-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHFT_CACHE_LINE_SIZE=64
+      - name: Build
+        run: cmake --build build -j
+      - name: Run and validate benchmark
+        run: |
+          ./build/hft_bench --output "$RUNNER_TEMP/bench.csv" \
+            --keys 2000 --lookups 4000 --ranges 100 --updates 200 --runs 2 --seed 0
+          python3 - "$RUNNER_TEMP/bench.csv" <<'PY'
+          import collections
+          import csv
+          import sys
+
+          with open(sys.argv[1], newline="") as handle:
+              rows = list(csv.DictReader(handle))
+          samples = [row for row in rows if row["record"] == "sample"]
+          medians = [row for row in rows if row["record"] == "median"]
+          assert samples, "no sample rows"
+          assert medians, "no median rows"
+          checksums = collections.defaultdict(set)
+          for row in samples:
+              checksums[row["run"]].add(row["checksum"])
+          inconsistent = {run: values for run, values in checksums.items() if len(values) != 1}
+          assert not inconsistent, f"backend checksums differ: {inconsistent}"
+          print(f"benchmark smoke ok: {len(checksums)} run(s), {len(medians)} median row(s)")
+          PY
