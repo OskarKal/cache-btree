@@ -24,7 +24,7 @@
 namespace {
 using Clock = std::chrono::steady_clock;
 struct Options {
-    std::string output, distribution = "uniform", flags = "not supplied";
+    std::string output, distribution = "uniform", backend = "all", flags = "not supplied";
     std::size_t keys = 10000, lookups = 20000, ranges = 300, updates = 2000, runs = 5;
     std::uint32_t seed = 42;
 };
@@ -47,9 +47,11 @@ Options parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help") {
-            std::cout << "Usage: hft_bench --output PATH [--distribution uniform|zipf] [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N] [--build-flags TEXT]\n"
+            std::cout << "Usage: hft_bench --output PATH [--distribution uniform|zipf] [--backend all|scalar|sse2|avx2] [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N] [--build-flags TEXT]\n"
                          "\n"
-                         "--distribution zipf uses a fixed exponent alpha = 1.5.\n"
+                         "--distribution zipf uses a fixed exponent alpha = 1.5 and biases\n"
+                         "lookups, ranges, and updates; inserts always cover every --keys key.\n"
+                         "--backend all (default) benchmarks every available backend in one run.\n"
                          "--seed accepts 0. Timings are phase totals in milliseconds, not per-operation.\n";
             std::exit(0);
         }
@@ -57,6 +59,7 @@ Options parse(int argc, char** argv) {
         std::string val = argv[i];
         if (arg == "--output") o.output = val;
         else if (arg == "--distribution") o.distribution = val;
+        else if (arg == "--backend") o.backend = val;
         else if (arg == "--keys") o.keys = number(val, 10000000);
         else if (arg == "--lookups") o.lookups = number(val, 100000000);
         else if (arg == "--ranges") o.ranges = number(val, 10000000);
@@ -69,15 +72,20 @@ Options parse(int argc, char** argv) {
     if (o.output.empty()) throw std::invalid_argument("--output is required");
     if (o.distribution != "uniform" && o.distribution != "zipf")
         throw std::invalid_argument("distribution must be uniform or zipf");
+    if (o.backend != "all" && o.backend != "scalar" && o.backend != "sse2" &&
+        o.backend != "avx2")
+        throw std::invalid_argument("backend must be all, scalar, sse2, or avx2");
     return o;
 }
 
 Workload generate(const Options& o) {
     std::mt19937 rng(o.seed);
-    // Shuffle Zipf ranks so popular keys are not clustered in key order.
-    std::vector<int32_t> ranks(o.keys);
-    std::iota(ranks.begin(), ranks.end(), 0);
-    std::shuffle(ranks.begin(), ranks.end(), rng);
+    // Every key is inserted exactly once, so the tree size is --keys for every
+    // distribution. Shuffling the insertion order avoids sorted-input bias.
+    std::vector<int32_t> keys(o.keys);
+    std::iota(keys.begin(), keys.end(), 0);
+    std::shuffle(keys.begin(), keys.end(), rng);
+    for (int32_t& key : keys) key *= 2; // even keys; key + 1 is a guaranteed miss
     std::vector<double> cdf;
     if (o.distribution == "zipf") {
         cdf.resize(o.keys);
@@ -86,27 +94,27 @@ Workload generate(const Options& o) {
         for (double& x : cdf) x /= total;
         cdf.back() = 1.0;
     }
-    auto key = [&]() -> int32_t {
+    // The distribution biases lookups, ranges, and updates only, not the
+    // inserted key set.
+    auto sample = [&]() -> int32_t {
         std::size_t rank;
         if (cdf.empty()) rank = std::uniform_int_distribution<std::size_t>(0, o.keys - 1)(rng);
         else rank = std::lower_bound(cdf.begin(), cdf.end(), std::generate_canonical<double, 53>(rng)) - cdf.begin();
-        return ranks[rank] * 2; // odd keys are guaranteed misses; bounded by --keys
+        return keys[rank];
     };
     Workload w;
-    for (std::size_t i = 0; i < o.keys; ++i) {
-        int32_t k = key(); w.inserts.push_back(k); w.initial[k] = k + 1;
+    for (int32_t key : keys) {
+        w.inserts.push_back(key); w.initial[key] = key + 1;
     }
-    std::uniform_int_distribution<std::size_t> pick(0, w.inserts.size() - 1);
     for (std::size_t i = 0; i < o.lookups; ++i) {
-        const int32_t k = w.inserts[pick(rng)];
-        w.lookups.push_back(k + static_cast<int32_t>(i % 2));
+        w.lookups.push_back(sample() + static_cast<int32_t>(i % 2));
     }
     constexpr int32_t lengths[] = {1, 8, 64};
     for (std::size_t i = 0; i < o.ranges; ++i)
-        w.ranges.emplace_back(w.inserts[pick(rng)] + static_cast<int32_t>(i % 2), lengths[i % 3]);
+        w.ranges.emplace_back(sample() + static_cast<int32_t>(i % 2), lengths[i % 3]);
     w.updated = w.initial;
     for (std::size_t i = 0; i < o.updates; ++i) {
-        const int32_t k = w.inserts[pick(rng)]; w.updates.push_back(k); w.updated[k] = -k - 1;
+        const int32_t k = sample(); w.updates.push_back(k); w.updated[k] = -k - 1;
     }
     return w;
 }
@@ -194,8 +202,17 @@ int main(int argc, char** argv) {
         out << "record,cpu,compiler,build_flags,line_bytes,available_sse2,available_avx2,distribution,zipf_alpha,seed,insert_ops,distinct_keys,lookup_ops,range_ops,update_ops,backend,run,insert_ms,lookup_ms,range_ms,update_ms,checksum\n";
         const auto prefix = csv(cpu()) + "," + csv(compiler()) + "," + csv(o.flags) + "," + std::to_string(HFT_CACHE_LINE_SIZE) + "," + std::to_string(hft::backend_available(hft::Backend::SSE2)) + "," + std::to_string(hft::backend_available(hft::Backend::AVX2)) + "," + o.distribution + "," + (o.distribution == "zipf" ? "1.5" : "") + "," + std::to_string(o.seed) + "," + std::to_string(o.keys) + "," + std::to_string(w.initial.size()) + "," + std::to_string(o.lookups) + "," + std::to_string(o.ranges) + "," + std::to_string(o.updates) + ",";
         std::vector<hft::Backend> modes;
-        for (auto mode : {hft::Backend::Scalar, hft::Backend::SSE2, hft::Backend::AVX2}) {
-            if (!hft::backend_available(mode)) { std::cout << "Skipping unavailable " << hft::backend_name(mode) << '\n'; continue; }
+        if (o.backend == "all") {
+            for (auto mode : {hft::Backend::Scalar, hft::Backend::SSE2, hft::Backend::AVX2}) {
+                if (!hft::backend_available(mode)) { std::cout << "Skipping unavailable " << hft::backend_name(mode) << '\n'; continue; }
+                modes.push_back(mode);
+            }
+        } else {
+            const hft::Backend mode = o.backend == "scalar" ? hft::Backend::Scalar
+                                      : o.backend == "sse2" ? hft::Backend::SSE2
+                                                            : hft::Backend::AVX2;
+            if (!hft::backend_available(mode))
+                throw std::runtime_error("requested backend is unavailable: " + o.backend);
             modes.push_back(mode);
         }
         for (auto mode : modes) run(mode, w); // untimed warmup, including correctness checks
