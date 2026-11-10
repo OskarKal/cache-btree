@@ -120,15 +120,19 @@ and again after updates; unavailable backends are skipped.
 Usage:
 
 ```
-hft_bench --output PATH [--distribution uniform|zipf] [--keys N]
-          [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N]
+hft_bench --output PATH [--distribution uniform|zipf]
+          [--backend all|scalar|sse2|avx2] [--keys N] [--lookups N]
+          [--ranges N] [--updates N] [--runs N] [--seed N]
           [--build-flags TEXT]
 ```
 
-`--help` prints the same summary. The zipf distribution uses a fixed exponent
-`alpha = 1.5`; `--seed` accepts 0. The output path is opened exclusively before
-the timed runs, so an existing path or missing parent directory fails
-immediately and is never overwritten.
+`--help` prints the same summary. Inserts always cover every `--keys` key
+exactly once, so tree size is the same for both distributions; `--distribution`
+biases lookups, ranges, and updates. Zipf uses a fixed exponent `alpha = 1.5`.
+`--backend` selects one kernel (default `all`), which is useful with external
+profilers. `--seed` accepts 0. The output path is opened exclusively before the
+timed runs, so an existing path or missing parent directory fails immediately
+and is never overwritten.
 
 The CSV written to `--output` records machine and build metadata (CPU,
 compiler, supplied build flags, cache-line size, SSE2/AVX2 availability),
