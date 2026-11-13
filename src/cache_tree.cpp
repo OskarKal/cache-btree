@@ -120,13 +120,18 @@ void CacheTree::split_root(Split split) {
 }
 
 void CacheTree::insert(std::int32_t key, std::int32_t value) {
-    std::vector<PathEntry> path;
+    // The root-to-leaf path is stored on the stack: a tree with int32 node
+    // indices and capacity_ >= 3 has minimum fanout 2, so the path is at most
+    // 32 entries. Avoiding a per-insert heap allocation matters on the hot path.
+    std::array<PathEntry, 64> path;
+    std::size_t depth = 0;
     std::int32_t index = 0;
     while (!nodes_[index].is_leaf()) {
         const Node& node = nodes_[index];
         const std::size_t child = hft::upper_bound_resolved(node.keys, node.count(), key,
                                                             backend_, readable_keys_);
-        path.push_back({index, child});
+        if (depth == path.size()) throw std::length_error("CacheTree depth exceeded");
+        path[depth++] = {index, child};
         index = node.slots[child];
     }
     const std::size_t count = nodes_[index].count();
@@ -156,8 +161,8 @@ void CacheTree::insert(std::int32_t key, std::int32_t value) {
     // also makes allocation failure or index exhaustion leave the tree intact.
     std::size_t needed = 1;
     bool reaches_root = true;
-    for (auto it = path.rbegin(); it != path.rend(); ++it) {
-        if (nodes_[it->index].count() < capacity_) {
+    for (std::size_t i = depth; i > 0; --i) {
+        if (nodes_[path[i - 1].index].count() < capacity_) {
             reaches_root = false;
             break;
         }
@@ -177,13 +182,14 @@ void CacheTree::insert(std::int32_t key, std::int32_t value) {
     }
 
     Split split = split_leaf(index, position, key, value);
-    for (auto it = path.rbegin(); it != path.rend(); ++it) {
-        if (nodes_[it->index].count() < capacity_) {
-            insert_internal(it->index, it->child, split);
+    for (std::size_t i = depth; i > 0; --i) {
+        const PathEntry& entry = path[i - 1];
+        if (nodes_[entry.index].count() < capacity_) {
+            insert_internal(entry.index, entry.child, split);
             ++size_;
             return;
         }
-        split = split_internal(it->index, it->child, split);
+        split = split_internal(entry.index, entry.child, split);
     }
     split_root(split);
     ++size_;
