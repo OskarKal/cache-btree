@@ -18,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,13 +28,66 @@ struct Options {
     std::string output, distribution = "uniform", backend = "all", flags = "not supplied";
     std::size_t keys = 10000, lookups = 20000, ranges = 300, updates = 2000, runs = 5;
     std::uint32_t seed = 42;
+    bool reserve = false;
 };
 struct Workload {
     std::vector<int32_t> inserts, lookups, updates;
     std::vector<std::pair<int32_t, int32_t>> ranges;
     std::map<int32_t, int32_t> initial, updated;
 };
-struct Sample { double insert, lookup, range, update; std::uint64_t checksum; };
+struct Sample {
+    double insert = 0, lookup = 0, range = 0, update = 0;
+    bool has_range = false;
+    std::uint64_t checksum = 0;
+};
+
+// One benchmark target: a CacheTree SIMD backend or an STL baseline.
+enum class Target { Scalar, SSE2, AVX2, StdMap, SortedVector, StdUnorderedMap };
+
+const char* target_name(Target target) {
+    switch (target) {
+        case Target::Scalar: return "scalar";
+        case Target::SSE2: return "sse2";
+        case Target::AVX2: return "avx2";
+        case Target::StdMap: return "std::map";
+        case Target::SortedVector: return "sorted_vector";
+        case Target::StdUnorderedMap: return "std::unordered_map";
+    }
+    return "unknown";
+}
+bool target_has_range(Target target) { return target != Target::StdUnorderedMap; }
+hft::Backend target_backend(Target target) {
+    switch (target) {
+        case Target::Scalar: return hft::Backend::Scalar;
+        case Target::SSE2: return hft::Backend::SSE2;
+        case Target::AVX2: return hft::Backend::AVX2;
+        case Target::StdMap:
+        case Target::SortedVector:
+        case Target::StdUnorderedMap: break;
+    }
+    throw std::runtime_error("target is not a CacheTree backend");
+}
+bool target_available(Target target) {
+    switch (target) {
+        case Target::Scalar: return hft::backend_available(hft::Backend::Scalar);
+        case Target::SSE2: return hft::backend_available(hft::Backend::SSE2);
+        case Target::AVX2: return hft::backend_available(hft::Backend::AVX2);
+        case Target::StdMap:
+        case Target::SortedVector:
+        case Target::StdUnorderedMap: return true;
+    }
+    return false;
+}
+Target target_from_name(const std::string& name) {
+    if (name == "scalar") return Target::Scalar;
+    if (name == "sse2") return Target::SSE2;
+    if (name == "avx2") return Target::AVX2;
+    if (name == "std_map") return Target::StdMap;
+    if (name == "sorted_vector") return Target::SortedVector;
+    if (name == "std_unordered_map") return Target::StdUnorderedMap;
+    throw std::invalid_argument(
+        "backend must be all, scalar, sse2, avx2, std_map, sorted_vector, or std_unordered_map");
+}
 
 std::size_t number(const std::string& s, std::size_t max, bool allow_zero = false) {
     if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos)
@@ -47,14 +101,21 @@ Options parse(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help") {
-            std::cout << "Usage: hft_bench --output PATH [--distribution uniform|zipf] [--backend all|scalar|sse2|avx2] [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N] [--build-flags TEXT]\n"
+            std::cout << "Usage: hft_bench --output PATH [--distribution uniform|zipf] [--backend all|scalar|sse2|avx2|std_map|sorted_vector|std_unordered_map] [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N] [--seed N] [--build-flags TEXT] [--reserve]\n"
                          "\n"
                          "--distribution zipf uses a fixed exponent alpha = 1.5 and biases\n"
                          "lookups, ranges, and updates; inserts always cover every --keys key.\n"
-                         "--backend all (default) benchmarks every available backend in one run.\n"
+                         "--backend all (default) benchmarks every available SIMD backend plus\n"
+                         "the std::map, sorted_vector, and std::unordered_map baselines.\n"
+                         "sorted_vector is bulk-loaded in the insert phase (append + sort), so\n"
+                         "its insert time is not comparable to incremental insertion.\n"
+                         "std::unordered_map has no ordered range query, so its range phase is\n"
+                         "reported as not measured (range_measured=0).\n"
+                         "--reserve pre-sizes the std::unordered_map baseline with reserve(keys).\n"
                          "--seed accepts 0. Timings are phase totals in milliseconds, not per-operation.\n";
             std::exit(0);
         }
+        if (arg == "--reserve") { o.reserve = true; continue; }
         if (++i == argc) throw std::invalid_argument("missing value for " + arg);
         std::string val = argv[i];
         if (arg == "--output") o.output = val;
@@ -72,9 +133,8 @@ Options parse(int argc, char** argv) {
     if (o.output.empty()) throw std::invalid_argument("--output is required");
     if (o.distribution != "uniform" && o.distribution != "zipf")
         throw std::invalid_argument("distribution must be uniform or zipf");
-    if (o.backend != "all" && o.backend != "scalar" && o.backend != "sse2" &&
-        o.backend != "avx2")
-        throw std::invalid_argument("backend must be all, scalar, sse2, or avx2");
+    if (o.backend != "all")
+        (void)target_from_name(o.backend); // validates the name and throws otherwise
     return o;
 }
 
@@ -124,7 +184,16 @@ std::vector<int32_t> expected_range(const std::map<int32_t, int32_t>& m, int32_t
         result.push_back(it->second);
     return result;
 }
-void verify(const hft::CacheTree& tree, const Workload& w, const std::map<int32_t, int32_t>& reference) {
+
+using SortedVector = std::vector<std::pair<int32_t, int32_t>>;
+
+bool entry_less(const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) {
+    return a.first < b.first;
+}
+bool key_less(const std::pair<int32_t, int32_t>& entry, int32_t key) {
+    return entry.first < key;
+}
+void verify_hft(const hft::CacheTree& tree, const Workload& w, const std::map<int32_t, int32_t>& reference) {
     if (tree.size() != reference.size() || !tree.validate()) throw std::runtime_error("tree size or structure mismatch");
     for (const auto& kv : reference)
         if (tree.find(kv.first) != kv.second) throw std::runtime_error("stored value mismatch");
@@ -137,21 +206,166 @@ void verify(const hft::CacheTree& tree, const Workload& w, const std::map<int32_
         if (tree.range_search(r.first, r.second) != expected_range(reference, r.first, r.second))
             throw std::runtime_error("range mismatch");
 }
+void verify_std_map(const std::map<int32_t, int32_t>& tree, const Workload& w,
+                    const std::map<int32_t, int32_t>& reference) {
+    if (!(tree == reference)) throw std::runtime_error("std::map contents mismatch");
+    for (int32_t k : w.lookups) {
+        auto it = reference.find(k); auto actual = tree.find(k);
+        if ((it == reference.end()) != (actual == tree.end()) ||
+            (actual != tree.end() && actual->second != it->second))
+            throw std::runtime_error("std::map lookup mismatch");
+    }
+    for (const auto& r : w.ranges) {
+        std::vector<int32_t> result;
+        for (auto it = tree.lower_bound(r.first);
+             it != tree.end() && result.size() < static_cast<std::size_t>(r.second); ++it)
+            result.push_back(it->second);
+        if (result != expected_range(reference, r.first, r.second))
+            throw std::runtime_error("std::map range mismatch");
+    }
+}
+void verify_std_unordered(const std::unordered_map<int32_t, int32_t>& tree,
+                          const Workload& w,
+                          const std::map<int32_t, int32_t>& reference) {
+    if (tree.size() != reference.size())
+        throw std::runtime_error("std::unordered_map size mismatch");
+    for (const auto& kv : reference) {
+        auto it = tree.find(kv.first);
+        if (it == tree.end() || it->second != kv.second)
+            throw std::runtime_error("std::unordered_map contents mismatch");
+    }
+    for (int32_t k : w.lookups) {
+        auto it = reference.find(k); auto actual = tree.find(k);
+        if ((it == reference.end()) != (actual == tree.end()) ||
+            (actual != tree.end() && actual->second != it->second))
+            throw std::runtime_error("std::unordered_map lookup mismatch");
+    }
+}
+void verify_sorted_vector(const SortedVector& tree, const Workload& w,
+                          const std::map<int32_t, int32_t>& reference) {
+    if (tree.size() != reference.size())
+        throw std::runtime_error("sorted_vector size mismatch");
+    auto entry = tree.begin();
+    for (const auto& kv : reference) {
+        if (entry == tree.end() || entry->first != kv.first || entry->second != kv.second)
+            throw std::runtime_error("sorted_vector contents mismatch");
+        ++entry;
+    }
+    for (int32_t k : w.lookups) {
+        auto it = reference.find(k);
+        auto actual = std::lower_bound(tree.begin(), tree.end(), k, key_less);
+        const bool found = actual != tree.end() && actual->first == k;
+        if ((it == reference.end()) != !found || (found && actual->second != it->second))
+            throw std::runtime_error("sorted_vector lookup mismatch");
+    }
+    for (const auto& r : w.ranges) {
+        std::vector<int32_t> result;
+        for (auto it = std::lower_bound(tree.begin(), tree.end(), r.first, key_less);
+             it != tree.end() && result.size() < static_cast<std::size_t>(r.second); ++it)
+            result.push_back(it->second);
+        if (result != expected_range(reference, r.first, r.second))
+            throw std::runtime_error("sorted_vector range mismatch");
+    }
+}
 template<class F> double timed(F f) {
     auto start = Clock::now(); f();
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
-Sample run(hft::Backend backend, const Workload& w) {
+Sample run_hft(hft::Backend backend, const Workload& w) {
     hft::CacheTree tree(backend);
     if (tree.backend() != backend) throw std::runtime_error("requested backend was not selected");
-    Sample s{};
+    Sample s;
+    s.has_range = true;
     s.insert = timed([&] { for (int32_t k : w.inserts) tree.insert(k, k + 1); });
-    verify(tree, w, w.initial);
+    verify_hft(tree, w, w.initial);
     s.lookup = timed([&] { for (int32_t k : w.lookups) { auto v = tree.find(k); if (v) s.checksum += static_cast<std::uint32_t>(*v); } });
     s.range = timed([&] { for (const auto& r : w.ranges) for (int32_t v : tree.range_search(r.first, r.second)) s.checksum += static_cast<std::uint32_t>(v); });
     s.update = timed([&] { for (int32_t k : w.updates) tree.insert(k, -k - 1); });
-    verify(tree, w, w.updated);
+    verify_hft(tree, w, w.updated);
     return s;
+}
+Sample run_std_map(const Workload& w) {
+    std::map<int32_t, int32_t> tree;
+    Sample s;
+    s.has_range = true;
+    s.insert = timed([&] { for (int32_t k : w.inserts) tree[k] = k + 1; });
+    verify_std_map(tree, w, w.initial);
+    s.lookup = timed([&] { for (int32_t k : w.lookups) { auto it = tree.find(k); if (it != tree.end()) s.checksum += static_cast<std::uint32_t>(it->second); } });
+    s.range = timed([&] {
+        for (const auto& r : w.ranges) {
+            std::size_t count = 0;
+            for (auto it = tree.lower_bound(r.first);
+                 it != tree.end() && count < static_cast<std::size_t>(r.second);
+                 ++it, ++count)
+                s.checksum += static_cast<std::uint32_t>(it->second);
+        }
+    });
+    s.update = timed([&] { for (int32_t k : w.updates) tree[k] = -k - 1; });
+    verify_std_map(tree, w, w.updated);
+    return s;
+}
+Sample run_sorted_vector(const Workload& w) {
+    SortedVector tree;
+    Sample s;
+    s.has_range = true;
+    // Bulk load: append every entry, then sort once. This is the static-data
+    // baseline; it is not comparable to incremental insertion.
+    s.insert = timed([&] {
+        tree.reserve(w.inserts.size());
+        for (int32_t k : w.inserts) tree.emplace_back(k, k + 1);
+        std::sort(tree.begin(), tree.end(), entry_less);
+    });
+    verify_sorted_vector(tree, w, w.initial);
+    s.lookup = timed([&] {
+        for (int32_t k : w.lookups) {
+            auto it = std::lower_bound(tree.begin(), tree.end(), k, key_less);
+            if (it != tree.end() && it->first == k)
+                s.checksum += static_cast<std::uint32_t>(it->second);
+        }
+    });
+    s.range = timed([&] {
+        for (const auto& r : w.ranges) {
+            std::size_t count = 0;
+            for (auto it = std::lower_bound(tree.begin(), tree.end(), r.first, key_less);
+                 it != tree.end() && count < static_cast<std::size_t>(r.second);
+                 ++it, ++count)
+                s.checksum += static_cast<std::uint32_t>(it->second);
+        }
+    });
+    s.update = timed([&] {
+        for (int32_t k : w.updates) {
+            auto it = std::lower_bound(tree.begin(), tree.end(), k, key_less);
+            if (it != tree.end() && it->first == k) it->second = -k - 1;
+            else tree.insert(it, {k, -k - 1});
+        }
+    });
+    verify_sorted_vector(tree, w, w.updated);
+    return s;
+}
+Sample run_std_unordered(const Workload& w, bool reserve) {
+    std::unordered_map<int32_t, int32_t> tree;
+    if (reserve) tree.reserve(w.inserts.size());
+    Sample s;
+    s.has_range = false;
+    s.insert = timed([&] { for (int32_t k : w.inserts) tree[k] = k + 1; });
+    verify_std_unordered(tree, w, w.initial);
+    s.lookup = timed([&] { for (int32_t k : w.lookups) { auto it = tree.find(k); if (it != tree.end()) s.checksum += static_cast<std::uint32_t>(it->second); } });
+    // No ordered range query exists for unordered_map; the phase is skipped and
+    // reported as not measured rather than emulated by sorting.
+    s.update = timed([&] { for (int32_t k : w.updates) tree[k] = -k - 1; });
+    verify_std_unordered(tree, w, w.updated);
+    return s;
+}
+Sample run(Target target, const Workload& w, bool reserve_unordered) {
+    switch (target) {
+        case Target::Scalar:
+        case Target::SSE2:
+        case Target::AVX2: return run_hft(target_backend(target), w);
+        case Target::StdMap: return run_std_map(w);
+        case Target::SortedVector: return run_sorted_vector(w);
+        case Target::StdUnorderedMap: return run_std_unordered(w, reserve_unordered);
+    }
+    throw std::runtime_error("unknown benchmark target");
 }
 double median(std::vector<double> v) {
     std::sort(v.begin(), v.end());
@@ -199,23 +413,25 @@ int main(int argc, char** argv) {
         const Workload w = generate(o);
         std::ostringstream out;
         out << std::setprecision(12);
-        out << "record,cpu,compiler,build_flags,line_bytes,available_sse2,available_avx2,distribution,zipf_alpha,seed,insert_ops,distinct_keys,lookup_ops,range_ops,update_ops,backend,run,insert_ms,lookup_ms,range_ms,update_ms,checksum\n";
+        out << "record,cpu,compiler,build_flags,line_bytes,available_sse2,available_avx2,distribution,zipf_alpha,seed,insert_ops,distinct_keys,lookup_ops,range_ops,update_ops,backend,range_measured,run,insert_ms,lookup_ms,range_ms,update_ms,checksum\n";
         const auto prefix = csv(cpu()) + "," + csv(compiler()) + "," + csv(o.flags) + "," + std::to_string(HFT_CACHE_LINE_SIZE) + "," + std::to_string(hft::backend_available(hft::Backend::SSE2)) + "," + std::to_string(hft::backend_available(hft::Backend::AVX2)) + "," + o.distribution + "," + (o.distribution == "zipf" ? "1.5" : "") + "," + std::to_string(o.seed) + "," + std::to_string(o.keys) + "," + std::to_string(w.initial.size()) + "," + std::to_string(o.lookups) + "," + std::to_string(o.ranges) + "," + std::to_string(o.updates) + ",";
-        std::vector<hft::Backend> modes;
+        std::vector<Target> modes;
         if (o.backend == "all") {
-            for (auto mode : {hft::Backend::Scalar, hft::Backend::SSE2, hft::Backend::AVX2}) {
-                if (!hft::backend_available(mode)) { std::cout << "Skipping unavailable " << hft::backend_name(mode) << '\n'; continue; }
-                modes.push_back(mode);
+            for (Target target : {Target::Scalar, Target::SSE2, Target::AVX2}) {
+                if (!target_available(target)) { std::cout << "Skipping unavailable " << target_name(target) << '\n'; continue; }
+                modes.push_back(target);
             }
+            // STL baselines are always available and use the same workload.
+            modes.push_back(Target::StdMap);
+            modes.push_back(Target::SortedVector);
+            modes.push_back(Target::StdUnorderedMap);
         } else {
-            const hft::Backend mode = o.backend == "scalar" ? hft::Backend::Scalar
-                                      : o.backend == "sse2" ? hft::Backend::SSE2
-                                                            : hft::Backend::AVX2;
-            if (!hft::backend_available(mode))
+            const Target target = target_from_name(o.backend);
+            if (!target_available(target))
                 throw std::runtime_error("requested backend is unavailable: " + o.backend);
-            modes.push_back(mode);
+            modes.push_back(target);
         }
-        for (auto mode : modes) run(mode, w); // untimed warmup, including correctness checks
+        for (auto mode : modes) run(mode, w, o.reserve); // untimed warmup, including correctness checks
         const std::size_t count = modes.size();
         std::vector<std::vector<double>> ins(count), look(count), ranges(count), updates(count);
         // Rotate the backend order each run so drift does not consistently favor
@@ -223,18 +439,25 @@ int main(int argc, char** argv) {
         for (std::size_t i = 0; i < o.runs; ++i) {
             for (std::size_t k = 0; k < count; ++k) {
                 const std::size_t index = (i + k) % count;
-                const auto s = run(modes[index], w);
+                const auto s = run(modes[index], w, o.reserve);
                 ins[index].push_back(s.insert); look[index].push_back(s.lookup); ranges[index].push_back(s.range); updates[index].push_back(s.update);
-                out << "sample," << prefix << csv(hft::backend_name(modes[index])) << ',' << i + 1 << ',' << s.insert << ',' << s.lookup << ',' << s.range << ',' << s.update << ',' << s.checksum << '\n';
+                out << "sample," << prefix << csv(target_name(modes[index])) << ',' << (s.has_range ? 1 : 0) << ',' << i + 1 << ',' << s.insert << ',' << s.lookup << ',';
+                if (s.has_range) out << s.range;
+                out << ',' << s.update << ',' << s.checksum << '\n';
             }
         }
         for (std::size_t index = 0; index < count; ++index) {
+            const bool has_range = target_has_range(modes[index]);
             const double insert = median(ins[index]);
             const double lookup = median(look[index]);
-            const double range = median(ranges[index]);
             const double update = median(updates[index]);
-            out << "median," << prefix << csv(hft::backend_name(modes[index])) << ",," << insert << ',' << lookup << ',' << range << ',' << update << ",\n";
-            std::cout << hft::backend_name(modes[index]) << " median ms: insert " << insert << ", lookup " << lookup << ", range " << range << ", update " << update << '\n';
+            out << "median," << prefix << csv(target_name(modes[index])) << ',' << (has_range ? 1 : 0) << ",," << insert << ',' << lookup << ',';
+            if (has_range) out << median(ranges[index]);
+            out << ',' << update << ",\n";
+            std::cout << target_name(modes[index]) << " median ms: insert " << insert << ", lookup " << lookup << ", range ";
+            if (has_range) std::cout << median(ranges[index]);
+            else std::cout << "n/a";
+            std::cout << ", update " << update << '\n';
         }
         const std::string data = out.str();
         const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();

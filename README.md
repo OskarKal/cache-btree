@@ -109,8 +109,15 @@ guarantee.
 ## Benchmark
 
 `hft_bench` compares the scalar, SSE2, and AVX2 backends on identical,
-deterministically generated workloads. Correctness is verified before timing
-and again after updates; unavailable backends are skipped.
+deterministically generated workloads, and includes `std::map`, a bulk-loaded
+sorted `std::vector`, and `std::unordered_map` baselines built from the same
+workload. Correctness is verified against a `std::map` oracle before timing and
+again after updates; unavailable SIMD backends are skipped.
+`std::unordered_map` has no ordered range query, so its range phase is reported
+as not measured rather than emulated by sorting. The sorted vector is
+bulk-loaded in the insert phase (append then one sort), so its insert time is
+not comparable to incremental insertion; it is a static-data baseline for
+lookups and ranges.
 
 ```bash
 ./build/hft_bench --output results.csv \
@@ -121,25 +128,51 @@ Usage:
 
 ```
 hft_bench --output PATH [--distribution uniform|zipf]
-          [--backend all|scalar|sse2|avx2] [--keys N] [--lookups N]
-          [--ranges N] [--updates N] [--runs N] [--seed N]
-          [--build-flags TEXT]
+          [--backend all|scalar|sse2|avx2|std_map|sorted_vector|std_unordered_map]
+          [--keys N] [--lookups N] [--ranges N] [--updates N] [--runs N]
+          [--seed N] [--build-flags TEXT] [--reserve]
 ```
 
 `--help` prints the same summary. Inserts always cover every `--keys` key
-exactly once, so tree size is the same for both distributions; `--distribution`
-biases lookups, ranges, and updates. Zipf uses a fixed exponent `alpha = 1.5`.
-`--backend` selects one kernel (default `all`), which is useful with external
-profilers. `--seed` accepts 0. The output path is opened exclusively before the
-timed runs, so an existing path or missing parent directory fails immediately
-and is never overwritten.
+exactly once, so container size is the same for both distributions;
+`--distribution` biases lookups, ranges, and updates. Zipf uses a fixed
+exponent `alpha = 1.5`. `--backend` selects one target; the default `all` runs
+every available SIMD backend plus the `std::map`, `sorted_vector`, and
+`std::unordered_map` baselines, and a single target is useful with external
+profilers. `--reserve` pre-sizes the `std::unordered_map` baseline with
+`reserve(keys)`. `--seed` accepts 0. The output path is opened exclusively
+before the timed runs, so an existing path or missing parent directory fails
+immediately and is never overwritten.
+
+A range-heavy run exercises the ordered structure rather than point lookups:
+
+```bash
+./build/hft_bench --output ranges.csv \
+  --keys 20000 --lookups 2000 --ranges 40000 --updates 200 --runs 3 --seed 42
+```
+
+Node size is a compile-time choice and changes the depth/scan tradeoff. The
+default is the detected L1 line size (64 bytes on the machine used here, 7 keys
+per node). In local measurements, 128-byte nodes (15 keys) were faster for
+lookups and ranges because the tree was shallower; 32-byte nodes (3 keys) were
+substantially worse. At 32 bytes the AVX2 kernel also falls back to scalar
+because a full 8-lane load does not fit in the node's readable key storage.
+Configure with `-DHFT_CACHE_LINE_SIZE=128` to measure a variant. These are
+observations on one machine, not permanent recommendations.
 
 The CSV written to `--output` records machine and build metadata (CPU,
 compiler, supplied build flags, cache-line size, SSE2/AVX2 availability),
-workload parameters, backend, run number, phase-total timings in milliseconds,
-and a checksum. Backend order rotates between runs to reduce drift bias.
-Timings are per-machine observations, not performance claims; whether a backend
+workload parameters, backend, whether the range phase was measured
+(`range_measured`), run number, phase-total timings in milliseconds, and a
+checksum. Backend order rotates between runs to reduce drift bias. Timings are
+per-machine observations, not performance claims; whether a SIMD backend
 vectorizes depends on the node capacity and the number of keys in the node.
+The STL baselines are measured under the same workload. The
+`std::unordered_map` baseline is not pre-sized unless `--reserve` is passed,
+and the sorted vector's insert phase is a bulk load rather than incremental
+insertion. The checksum covers lookup results and, where the range phase was
+measured, range results, so it is comparable only among targets that ran the
+same phases (all except `std_unordered_map`).
 
 ## Configuration
 
@@ -165,6 +198,9 @@ is unavailable on the CPU or was compiled out.
 - Correctness is covered by the test suite on the tested configurations; there
   is no fuzzing campaign or formal verification.
 - No latency, throughput, or suitability claims are made for any workload.
+  The benchmark's point-lookup phases favor hash tables, and a bulk-loaded
+  sorted vector can be faster for static range queries; this structure targets
+  dynamic ordered range queries and ordered iteration.
 - The cache-line size is compile-time; rebuild for each target. SIMD
   availability depends on the compiler, architecture, `HFT_SIMD` ceiling, CPU,
   and OS-enabled register state.

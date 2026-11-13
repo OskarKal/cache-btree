@@ -70,10 +70,18 @@ jobs:
           medians = [row for row in rows if row["record"] == "median"]
           assert samples, "no sample rows"
           assert medians, "no median rows"
+          backends = {row["backend"] for row in samples}
+          assert "std::map" in backends, f"std::map baseline missing: {sorted(backends)}"
+          assert "sorted_vector" in backends, f"sorted_vector baseline missing: {sorted(backends)}"
+          assert "std::unordered_map" in backends, f"std::unordered_map baseline missing: {sorted(backends)}"
+          # The checksum covers lookup and range results. std::unordered_map has
+          # no ordered range, so compare checksums only within the same
+          # range-measured group for each run.
           checksums = collections.defaultdict(set)
           for row in samples:
-              checksums[row["run"]].add(row["checksum"])
-          inconsistent = {run: values for run, values in checksums.items() if len(values) != 1}
+              checksums[(row["run"], row["range_measured"])].add(row["checksum"])
+          inconsistent = {key: values for key, values in checksums.items() if len(values) != 1}
           assert not inconsistent, f"backend checksums differ: {inconsistent}"
-          print(f"benchmark smoke ok: {len(checksums)} run(s), {len(medians)} median row(s)")
+          print(f"benchmark smoke ok: {len({row['run'] for row in samples})} run(s), "
+                f"{len(medians)} median row(s), backends: {sorted(backends)}")
           PY
