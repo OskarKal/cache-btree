@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 560" width="960" height="560" role="img" aria-labelledby="chart-title chart-desc" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title id="chart-title">SIMD backend comparison</title>
+<desc id="chart-desc">Four panels compare insert, lookup, range, and update phase totals for the scalar, SSE2, and AVX2 search backends. Lower is better; each panel has its own y-scale. Exact values are in the benchmark table in the README.</desc>
+<rect width="960" height="560" fill="#1a1a19"/>
+<text x="64" y="34" font-size="18" font-weight="600" fill="#f0efec">SIMD backend comparison</text>
+<text x="64" y="58" font-size="12" fill="#c3c2b7">100k keys · 200k lookups · 5k ranges · 20k updates · medians of 21 samples · each panel has its own scale · lower is better</text>
+<rect x="64" y="78" width="10" height="10" rx="2" fill="#3987e5"/>
+<text x="80" y="87" font-size="12" fill="#c3c2b7">scalar</text>
+<rect x="164" y="78" width="10" height="10" rx="2" fill="#d95926"/>
+<text x="180" y="87" font-size="12" fill="#c3c2b7">SSE2</text>
+<rect x="264" y="78" width="10" height="10" rx="2" fill="#199e70"/>
+<text x="280" y="87" font-size="12" fill="#c3c2b7">AVX2</text>
+<text x="64.0" y="133.0" font-size="13" font-weight="600" fill="#f0efec">Insert</text>
+<line x1="108.0" y1="301.00" x2="478.0" y2="301.00" stroke="#383835" stroke-width="1"/>
+<text x="100.0" y="305.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">0</text>
+<line x1="108.0" y1="262.25" x2="478.0" y2="262.25" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="266.25" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">10</text>
+<line x1="108.0" y1="223.50" x2="478.0" y2="223.50" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="227.50" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">20</text>
+<line x1="108.0" y1="184.75" x2="478.0" y2="184.75" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="188.75" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">30</text>
+<line x1="108.0" y1="146.00" x2="478.0" y2="146.00" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="150.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">40</text>
+<g><title>scalar, insert: 32.87 ms</title>
+<path d="M261.00,301.00 L261.00,177.64 Q261.00,173.64 265.00,173.64 L277.00,173.64 Q281.00,173.64 281.00,177.64 L281.00,301.00 Z" fill="#3987e5"/>
+</g>
+<g><title>SSE2, insert: 23.37 ms</title>
+<path d="M283.00,301.00 L283.00,214.44 Q283.00,210.44 287.00,210.44 L299.00,210.44 Q303.00,210.44 303.00,214.44 L303.00,301.00 Z" fill="#d95926"/>
+</g>
+<g><title>AVX2, insert: 19.29 ms</title>
+<path d="M305.00,301.00 L305.00,230.24 Q305.00,226.24 309.00,226.24 L321.00,226.24 Q325.00,226.24 325.00,230.24 L325.00,301.00 Z" fill="#199e70"/>
+</g>
+<text x="315.00" y="220.24" font-size="10" text-anchor="middle" fill="#c3c2b7" font-variant-numeric="tabular-nums">19.29</text>
+<text x="514.0" y="133.0" font-size="13" font-weight="600" fill="#f0efec">Lookup</text>
+<line x1="558.0" y1="301.00" x2="928.0" y2="301.00" stroke="#383835" stroke-width="1"/>
+<text x="550.0" y="305.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">0</text>
+<line x1="558.0" y1="262.25" x2="928.0" y2="262.25" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="266.25" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">20</text>
+<line x1="558.0" y1="223.50" x2="928.0" y2="223.50" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="227.50" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">40</text>
+<line x1="558.0" y1="184.75" x2="928.0" y2="184.75" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="188.75" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">60</text>
+<line x1="558.0" y1="146.00" x2="928.0" y2="146.00" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="150.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">80</text>
+<g><title>scalar, lookup: 61.20 ms</title>
+<path d="M711.00,301.00 L711.00,186.43 Q711.00,182.43 715.00,182.43 L727.00,182.43 Q731.00,182.43 731.00,186.43 L731.00,301.00 Z" fill="#3987e5"/>
+</g>
+<g><title>SSE2, lookup: 48.25 ms</title>
+<path d="M733.00,301.00 L733.00,211.51 Q733.00,207.51 737.00,207.51 L749.00,207.51 Q753.00,207.51 753.00,211.51 L753.00,301.00 Z" fill="#d95926"/>
+</g>
+<g><title>AVX2, lookup: 36.77 ms</title>
+<path d="M755.00,301.00 L755.00,233.76 Q755.00,229.76 759.00,229.76 L771.00,229.76 Q775.00,229.76 775.00,233.76 L775.00,301.00 Z" fill="#199e70"/>
+</g>
+<text x="765.00" y="223.76" font-size="10" text-anchor="middle" fill="#c3c2b7" font-variant-numeric="tabular-nums">36.77</text>
+<text x="64.0" y="348.0" font-size="13" font-weight="600" fill="#f0efec">Range</text>
+<line x1="108.0" y1="516.00" x2="478.0" y2="516.00" stroke="#383835" stroke-width="1"/>
+<text x="100.0" y="520.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">0</text>
+<line x1="108.0" y1="477.25" x2="478.0" y2="477.25" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="481.25" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">1</text>
+<line x1="108.0" y1="438.50" x2="478.0" y2="438.50" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="442.50" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">2</text>
+<line x1="108.0" y1="399.75" x2="478.0" y2="399.75" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="403.75" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">3</text>
+<line x1="108.0" y1="361.00" x2="478.0" y2="361.00" stroke="#2c2c2a" stroke-width="1"/>
+<text x="100.0" y="365.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">4</text>
+<g><title>scalar, range: 2.70 ms</title>
+<path d="M261.00,516.00 L261.00,415.31 Q261.00,411.31 265.00,411.31 L277.00,411.31 Q281.00,411.31 281.00,415.31 L281.00,516.00 Z" fill="#3987e5"/>
+</g>
+<g><title>SSE2, range: 2.39 ms</title>
+<path d="M283.00,516.00 L283.00,427.30 Q283.00,423.30 287.00,423.30 L299.00,423.30 Q303.00,423.30 303.00,427.30 L303.00,516.00 Z" fill="#d95926"/>
+</g>
+<g><title>AVX2, range: 2.13 ms</title>
+<path d="M305.00,516.00 L305.00,437.31 Q305.00,433.31 309.00,433.31 L321.00,433.31 Q325.00,433.31 325.00,437.31 L325.00,516.00 Z" fill="#199e70"/>
+</g>
+<text x="315.00" y="427.31" font-size="10" text-anchor="middle" fill="#c3c2b7" font-variant-numeric="tabular-nums">2.13</text>
+<text x="514.0" y="348.0" font-size="13" font-weight="600" fill="#f0efec">Update</text>
+<line x1="558.0" y1="516.00" x2="928.0" y2="516.00" stroke="#383835" stroke-width="1"/>
+<text x="550.0" y="520.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">0</text>
+<line x1="558.0" y1="477.25" x2="928.0" y2="477.25" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="481.25" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">2</text>
+<line x1="558.0" y1="438.50" x2="928.0" y2="438.50" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="442.50" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">4</text>
+<line x1="558.0" y1="399.75" x2="928.0" y2="399.75" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="403.75" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">6</text>
+<line x1="558.0" y1="361.00" x2="928.0" y2="361.00" stroke="#2c2c2a" stroke-width="1"/>
+<text x="550.0" y="365.00" font-size="10" text-anchor="end" fill="#898781" font-variant-numeric="tabular-nums">8</text>
+<g><title>scalar, update: 5.69 ms</title>
+<path d="M711.00,516.00 L711.00,409.72 Q711.00,405.72 715.00,405.72 L727.00,405.72 Q731.00,405.72 731.00,409.72 L731.00,516.00 Z" fill="#3987e5"/>
+</g>
+<g><title>SSE2, update: 4.19 ms</title>
+<path d="M733.00,516.00 L733.00,438.90 Q733.00,434.90 737.00,434.90 L749.00,434.90 Q753.00,434.90 753.00,438.90 L753.00,516.00 Z" fill="#d95926"/>
+</g>
+<g><title>AVX2, update: 3.01 ms</title>
+<path d="M755.00,516.00 L755.00,461.74 Q755.00,457.74 759.00,457.74 L771.00,457.74 Q775.00,457.74 775.00,461.74 L775.00,516.00 Z" fill="#199e70"/>
+</g>
+<text x="765.00" y="451.74" font-size="10" text-anchor="middle" fill="#c3c2b7" font-variant-numeric="tabular-nums">3.01</text>
+<text x="64" y="544" font-size="10" fill="#898781">Intel Core i5-10210U · GCC 16.2.1 · generated by scripts/plot_benchmark.py</text>
+</svg>

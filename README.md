@@ -3,8 +3,8 @@
 A small C++17 library built around `hft::CacheTree`, an insertion-only B+ tree
 whose node layout is sized to one cache line, plus runtime-dispatched SIMD
 search kernels. This is an experimental systems-programming project. It makes
-no claims about production readiness, trading suitability, tail latency, or
-speedups over other data structures.
+no claims about production readiness, trading suitability, or tail latency;
+the benchmark section reports per-machine observations with their caveats.
 
 ## Overview
 
@@ -57,14 +57,85 @@ src/cache_tree.cpp
 src/simd_search.cpp
 tests/test_cache_tree.cpp
 benchmark_both.cpp
+scripts/plot_benchmark.py
+docs/benchmark-light.svg, docs/benchmark-dark.svg
 
 ordinalB++tree.h       experimental reference
 ```
 
 `include/hft/config.hpp` is generated into the build tree at
 `generated/hft/config.hpp` during CMake configuration and defines
-`HFT_CACHE_LINE_SIZE`. The `integration` branch contains all of these paths;
+`HFT_CACHE_LINE_SIZE`. The `baseline` branch contains all of these paths;
 other branches may contain only a subset.
+
+## Architecture
+
+### Node layout
+
+Each node is exactly one cache line and is aligned to it. The key capacity is
+derived at compile time:
+
+```
+C = (line_bytes - 8) / 8
+```
+
+```text
+byte 0            4                                     4 + 4*C
++----------------+-------------------------------------+-----------------------------+
+| metadata (u32) | keys[0..C-1] (int32, sorted)        | slots[0..C] (int32)         |
++----------------+-------------------------------------+-----------------------------+
+```
+
+The metadata's high bit is the leaf flag and the low 31 bits are the key count.
+`slots` has `C + 1` entries:
+
+- **Leaf:** `slots[0..count)` hold values; `slots[C]` is the next leaf index
+  (0 terminates the chain). Leaves form a singly linked list in key order.
+- **Internal:** `slots[0..count]` hold child indices; `keys[i]` is the first key
+  of child `i + 1`. Routing uses `upper_bound`, so a key equal to a separator
+  goes right; leaf lookup uses `lower_bound`.
+
+| line bytes | key capacity `C` | slots | readable int32s from `keys` |
+|---:|---:|---:|---:|
+| 32 | 3 | 4 | 7 |
+| 64 | 7 | 8 | 15 |
+| 128 | 15 | 16 | 31 |
+
+`sizeof(Node)`, `alignof(Node)`, and `offsetof(Node, keys)` are checked against
+the configured line size with `static_assert`.
+
+### Insert and split
+
+Insertion walks from the root, recording node indices and child positions on a
+fixed-size stack array; the depth is bounded by the 32-bit index space and a
+minimum fanout of two (at most 32 levels). If the target leaf has room, entries
+shift right and the key is inserted in order. Otherwise the node splits at
+`(C + 1) / 2`, the separator is promoted, and the split cascades upward; a full
+root is replaced by a new root with two children. Every node the cascade can
+need is reserved before the tree is modified, so an allocation failure leaves
+the tree unchanged.
+
+### Range scans
+
+`range_search(start, max_count)` finds the first leaf with `lower_bound`, copies
+matching values, then follows `slots[C]` to the next leaf until it has
+`max_count` values or reaches the end of the chain. After the first leaf the
+scan never re-enters the internal levels.
+
+### SIMD search
+
+The vector kernels compare a full vector of keys at once. `keys` starts at byte
+4, so `(line_bytes - 4) / 4` int32 values are readable from `keys` onward (the
+key array plus the slot array). A vector load at the start of the key array
+therefore stays inside the node object even when the node holds fewer keys than
+the vector width. Lanes at or beyond `count()` are masked out before the result
+is used; the scalar loop is used when a full vector does not fit in the readable
+room. At a 32-byte line the AVX2 kernel falls back to scalar because 8 lanes do
+not fit in the 7 readable int32s.
+
+With capacity `C`, point lookup and insert take `O(log_C n)` node hops plus
+`O(C)` work per node; a range scan returning `k` values takes
+`O(log_C n + k)`.
 
 ## Build
 
@@ -100,11 +171,11 @@ ctest --test-dir build --output-on-failure
 ```
 
 Verified on this machine (Intel i5-10210U, 64-byte L1 line, GCC 16.2.1): tests
-passed at `HFT_CACHE_LINE_SIZE` 32, 64, and 128; with `HFT_SIMD` set to
-`SCALAR` and `SSE2`; and with `-DHFT_ENABLE_SANITIZERS=ON`. Sanitizer failures
-abort (UBSan is built with `-fno-sanitize-recover=all`), so they fail CTest.
-These results are specific to this machine and toolchain, not a permanent
-guarantee.
+passed at `HFT_CACHE_LINE_SIZE` 32, 64, and 128 with `HFT_SIMD` set to `AUTO`,
+`SCALAR`, `SSE2`, and `AVX2`, and with `-DHFT_ENABLE_SANITIZERS=ON`. Sanitizer
+failures abort (UBSan is built with `-fno-sanitize-recover=all`), so they fail
+CTest. These results are specific to this machine and toolchain, not a
+permanent guarantee.
 
 ## Benchmark
 
@@ -143,6 +214,53 @@ profilers. `--reserve` pre-sizes the `std::unordered_map` baseline with
 `reserve(keys)`. `--seed` accepts 0. The output path is opened exclusively
 before the timed runs, so an existing path or missing parent directory fails
 immediately and is never overwritten.
+
+### Results
+
+Measured on an Intel Core i5-10210U (64-byte L1 line, GCC 16.2.1, Linux) with
+100k keys, 200k lookups, 5k ranges, and 20k updates. Each cell is the median of
+21 samples: 7 runs per invocation, 3 invocations, pinned to one CPU with
+`taskset`.
+
+| target | insert (ms) | lookup (ms) | range (ms) | update (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| scalar | 32.87 | 61.20 | 2.70 | 5.69 |
+| SSE2 | 23.37 | 48.25 | 2.39 | 4.19 |
+| AVX2 | 19.29 | 36.77 | 2.13 | 3.01 |
+| `std::map` | 42.35 | 96.62 | 7.68 | 8.12 |
+| sorted `std::vector` | 12.05* | 42.99 | 1.22 | 3.57 |
+| `std::unordered_map` | 14.51 | 11.05 | n/a | 1.01 |
+
+\* Bulk load (append + one sort), not comparable to incremental insertion.
+
+On this workload and machine, AVX2 is about 1.7× faster than scalar on insert
+and lookup, 1.9× on updates, and 1.3× on ranges; it is 2.2–3.6× faster than
+`std::map` across the four phases. The range comparison is conservative for
+`CacheTree`: its `range_search` allocates a result vector per call, while the
+STL baselines do not.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark-dark.svg">
+  <img src="docs/benchmark-light.svg" alt="SIMD backend comparison: insert, lookup, range, and update phase totals for scalar, SSE2, and AVX2; lower is better">
+</picture>
+
+Reproduce with:
+
+```bash
+for i in 1 2 3; do
+  rm -f "results-$i.csv"
+  taskset -c 2 ./build/hft_bench --output "results-$i.csv" \
+    --backend all --keys 100000 --lookups 200000 --ranges 5000 \
+    --updates 20000 --runs 7 --seed 42
+done
+python3 scripts/plot_benchmark.py \
+  --input results-1.csv results-2.csv results-3.csv --out-dir docs
+```
+
+`taskset` is Linux-specific; drop it on other systems. These are
+single-machine microbenchmarks, not production or latency claims. Point
+lookups favor hash tables and static range scans favor a bulk-loaded sorted
+vector; this structure targets dynamic ordered range queries.
 
 A range-heavy run exercises the ordered structure rather than point lookups:
 
@@ -197,7 +315,7 @@ is unavailable on the CPU or was compiled out.
   single-threaded.
 - Correctness is covered by the test suite on the tested configurations; there
   is no fuzzing campaign or formal verification.
-- No latency, throughput, or suitability claims are made for any workload.
+- No latency, throughput, or suitability guarantees are made for any workload.
   The benchmark's point-lookup phases favor hash tables, and a bulk-loaded
   sorted vector can be faster for static range queries; this structure targets
   dynamic ordered range queries and ordered iteration.
