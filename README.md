@@ -8,15 +8,17 @@ the benchmark section reports per-machine observations with their caveats.
 
 ## Quickstart
 
-Requires CMake 3.16 or newer and a C++17 compiler.
+Requires CMake 3.16 or newer and a C++17-compatible compiler.
 
 ```bash
-git clone git@github.com:OskarKal/cache-btree.git
+git clone https://github.com/OskarKal/cache-btree.git
 cd cache-btree
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+This builds the library and test suite, then runs the tests.
 
 ## Overview
 
