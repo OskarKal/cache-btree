@@ -74,8 +74,6 @@ tests/test_cache_tree.cpp
 benchmark_both.cpp
 scripts/plot_benchmark.py
 docs/benchmark-light.svg, docs/benchmark-dark.svg
-
-ordinalB++tree.h       experimental reference
 ```
 
 `include/hft/config.hpp` is generated into the build tree at
