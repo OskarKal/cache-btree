@@ -65,7 +65,7 @@ ordinalB++tree.h       experimental reference
 
 `include/hft/config.hpp` is generated into the build tree at
 `generated/hft/config.hpp` during CMake configuration and defines
-`HFT_CACHE_LINE_SIZE`. The `baseline` branch contains all of these paths;
+`HFT_CACHE_LINE_SIZE`. The `main` branch contains all of these paths;
 other branches may contain only a subset.
 
 ## Architecture

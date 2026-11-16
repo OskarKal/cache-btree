@@ -29,3 +29,10 @@ callgrind.out.*
 .idea/
 *.swp
 .DS_Store
+
+# Scratch space and tool caches
+tmp/
+.cache/
+
+# Generated tooling output
+compile_commands.json
