@@ -6,6 +6,18 @@ search kernels. This is an experimental systems-programming project. It makes
 no claims about production readiness, trading suitability, or tail latency;
 the benchmark section reports per-machine observations with their caveats.
 
+## Quickstart
+
+Requires CMake 3.16 or newer and a C++17 compiler.
+
+```bash
+git clone git@github.com:OskarKal/cache-btree.git
+cd cache-btree
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
 ## Overview
 
 - **`hft::CacheTree`** — insertion-only B+ tree. Inserting an existing key
@@ -322,5 +334,3 @@ is unavailable on the CPU or was compiled out.
 - The cache-line size is compile-time; rebuild for each target. SIMD
   availability depends on the compiler, architecture, `HFT_SIMD` ceiling, CPU,
   and OS-enabled register state.
-- The ordinal tree is not part of the maintained library and should not be
-  relied upon.
