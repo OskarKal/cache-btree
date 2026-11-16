@@ -15,7 +15,8 @@ git clone https://github.com/OskarKal/cache-btree.git
 cd cache-btree
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+cd build
+ctest --output-on-failure
 ```
 
 This builds the library and test suite, then runs the tests.
@@ -181,7 +182,8 @@ asserts that `Auto` resolves to the highest available backend and that forced
 unavailable backends are rejected.
 
 ```bash
-ctest --test-dir build --output-on-failure
+cd build
+ctest --output-on-failure
 ```
 
 Verified on this machine (Intel i5-10210U, 64-byte L1 line, GCC 16.2.1): tests
